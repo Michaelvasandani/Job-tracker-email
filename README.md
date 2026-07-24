@@ -1,19 +1,21 @@
 # Job Application Email Tracker
 
-A private, manually triggered Python command that creates and reuses a
-dedicated Google spreadsheet for tracking job Applications.
+A private, manually triggered Python command that reads Gmail submission
+confirmations, previews derived job Applications, and appends approved rows to
+a dedicated Google spreadsheet.
 
-This first implementation establishes the local foundation: one installed-app
-Google OAuth grant, one cached token, one SQLite state database, and one
-spreadsheet with `Applications`, `Needs Review`, and `Stats` tabs. Email
-classification and synchronization are planned in the later tickets under
-`.scratch/job-application-email-tracker/issues/`.
+The command uses one installed-app Google OAuth grant, one cached token, local
+SQLite state, and one spreadsheet with `Applications`, `Needs Review`, and
+`Stats` tabs. Clear English submission confirmations are classified with
+OpenAI structured outputs. Every proposed Application must be approved before
+an `Applications` row or successful-sync checkpoint is written.
 
 ## Requirements
 
 - Python 3.11 or newer
 - A Google Cloud project with the Gmail API and Google Sheets API enabled
 - An OAuth 2.0 client configured as a **Desktop app**
+- An OpenAI API key
 
 The command requests only these Google permissions:
 
@@ -32,12 +34,20 @@ Download the desktop OAuth client file from Google Cloud. Either place it at
 `~/.local/share/job-tracker-email/credentials.json` or pass its path explicitly:
 
 ```bash
+export OPENAI_API_KEY="your-api-key"
 job-tracker-email --client-secrets /path/to/credentials.json
 ```
 
 The first run opens Google's installed-application authorization flow and
-creates `Job Application Tracker`. Later runs reuse its ID from local SQLite
-state. By default, cached authorization and state are stored under
+creates `Job Application Tracker`. The command reads eligible Gmail messages
+in chronological order and sends only sender, subject, timestamp, and
+normalized plain-text body to OpenAI. It never opens or transmits attachments.
+
+For each clearly confirmed Application, the command previews Company,
+Position, Application Date, Status, and Stage. Enter `y` or `yes` to append the
+row. Any other response cancels the batch without advancing the checkpoint.
+Later runs reuse the spreadsheet ID and successful checkpoint from local
+SQLite state. By default, cached authorization and state are stored under
 `~/.local/share/job-tracker-email/`.
 
 To choose a different private data directory:
@@ -50,6 +60,15 @@ job-tracker-email \
 
 The equivalent environment variables are
 `JOB_TRACKER_GOOGLE_CLIENT_SECRETS` and `JOB_TRACKER_DATA_DIR`.
+
+Raw email bodies are not written to the spreadsheet, SQLite state, or normal
+console output. OpenAI Responses are requested with server-side storage
+disabled. Spreadsheet-write errors leave the checkpoint unchanged so the
+command can be retried; an exact row check prevents a duplicate after an
+ambiguous write result.
+
+For a live end-to-end verification, follow the
+[manual smoke test](docs/manual-smoke-test.md).
 
 ## Develop
 

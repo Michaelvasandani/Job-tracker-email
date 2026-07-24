@@ -4,6 +4,7 @@ import argparse
 import os
 import sys
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol, TextIO
 
@@ -12,7 +13,15 @@ from job_tracker_email.google_workspace import (
     GoogleAuthConfig,
     TrackerSpreadsheet,
 )
+from job_tracker_email.openai_classifier import (
+    OpenAIApplicationClassifier,
+)
 from job_tracker_email.state import SqliteTrackerState
+from job_tracker_email.sync import (
+    Application,
+    ClassificationInput,
+    MailboxScan,
+)
 
 
 TRACKER_SPREADSHEET = TrackerSpreadsheet(
@@ -39,33 +48,160 @@ class TrackerState(Protocol):
 
     def save_spreadsheet_id(self, spreadsheet_id: str) -> None: ...
 
+    def get_successful_checkpoint(self) -> str | None: ...
+
+    def has_processed_message(self, message_id: str) -> bool: ...
+
+    def record_successful_sync(
+        self,
+        checkpoint: str,
+        message_ids: tuple[str, ...],
+    ) -> None: ...
+
+
+class Mailbox(Protocol):
+    def find_messages(
+        self,
+        after_checkpoint: str | None,
+    ) -> MailboxScan: ...
+
+
+class ApplicationClassifier(Protocol):
+    def classify(
+        self,
+        message: ClassificationInput,
+    ) -> Application | None: ...
+
+
+class ApplicationSheet(Protocol):
+    def has_application(
+        self,
+        spreadsheet_id: str,
+        application: Application,
+    ) -> bool: ...
+
+    def append_application(
+        self,
+        spreadsheet_id: str,
+        application: Application,
+    ) -> None: ...
+
+
+class GoogleSyncWorkspace(
+    GoogleWorkspace,
+    Mailbox,
+    ApplicationSheet,
+    Protocol,
+):
+    pass
+
+
+@dataclass(frozen=True)
+class SyncAdapters:
+    mailbox: Mailbox
+    classifier: ApplicationClassifier
+    application_sheet: ApplicationSheet
+    confirm: Callable[[], bool]
+
 
 def run(
     *,
     workspace: GoogleWorkspace,
     state: TrackerState,
     stdout: TextIO,
+    stderr: TextIO | None = None,
+    sync: SyncAdapters | None = None,
 ) -> int:
-    if state.get_spreadsheet_id() is not None:
+    error_output = sys.stderr if stderr is None else stderr
+    spreadsheet_id = state.get_spreadsheet_id()
+    if spreadsheet_id is not None:
         stdout.write("Reusing Job Application Tracker.\n")
+    else:
+        spreadsheet_id = workspace.create_spreadsheet(TRACKER_SPREADSHEET)
+        state.save_spreadsheet_id(spreadsheet_id)
+        stdout.write("Created Job Application Tracker.\n")
+
+    if sync is None:
         return 0
 
-    spreadsheet_id = workspace.create_spreadsheet(TRACKER_SPREADSHEET)
-    state.save_spreadsheet_id(spreadsheet_id)
-    stdout.write("Created Job Application Tracker.\n")
+    scan = sync.mailbox.find_messages(state.get_successful_checkpoint())
+    messages = tuple(
+        message
+        for message in scan.messages
+        if not state.has_processed_message(message.message_id)
+    )
+    proposals: list[tuple[str, Application]] = []
+    for message in messages:
+        application = sync.classifier.classify(
+            ClassificationInput(
+                sender=message.sender,
+                subject=message.subject,
+                timestamp=message.timestamp,
+                normalized_body=message.normalized_body,
+            )
+        )
+        if application is not None:
+            proposals.append((message.message_id, application))
+
+    if not proposals:
+        state.record_successful_sync(
+            scan.checkpoint,
+            tuple(message.message_id for message in messages),
+        )
+        return 0
+
+    stdout.write("Proposed Applications:\n")
+    for _, application in proposals:
+        stdout.write(
+            f"  Company: {application.company}\n"
+            f"  Position: {application.position}\n"
+            f"  Application Date: {application.application_date}\n"
+            f"  Status: {application.status}\n"
+            f"  Stage: {application.stage or '(blank)'}\n"
+        )
+
+    if not sync.confirm():
+        stdout.write("Cancelled; no Applications imported.\n")
+        return 0
+
+    try:
+        for _, application in proposals:
+            if sync.application_sheet.has_application(
+                spreadsheet_id,
+                application,
+            ):
+                continue
+            sync.application_sheet.append_application(
+                spreadsheet_id,
+                application,
+            )
+    except Exception:
+        error_output.write(
+            "Could not update Job Application Tracker. Try again.\n"
+        )
+        return 1
+    state.record_successful_sync(
+        scan.checkpoint,
+        tuple(message.message_id for message in messages),
+    )
+    stdout.write("Application imported.\n")
     return 0
 
 
-WorkspaceFactory = Callable[[GoogleAuthConfig], GoogleWorkspace]
+WorkspaceFactory = Callable[[GoogleAuthConfig], GoogleSyncWorkspace]
+ClassifierFactory = Callable[[], ApplicationClassifier]
 
 
 def main(
     argv: Sequence[str] | None = None,
     *,
     workspace_factory: WorkspaceFactory = GoogleApiWorkspace,
+    classifier_factory: ClassifierFactory = OpenAIApplicationClassifier,
+    stdin: TextIO | None = None,
     stdout: TextIO | None = None,
     stderr: TextIO | None = None,
 ) -> int:
+    input_stream = sys.stdin if stdin is None else stdin
     output = sys.stdout if stdout is None else stdout
     error_output = sys.stderr if stderr is None else stderr
     arguments = _parser().parse_args(argv)
@@ -88,11 +224,32 @@ def main(
     try:
         workspace = workspace_factory(auth_config)
         with SqliteTrackerState(data_dir / "tracker.sqlite3") as state:
-            return run(workspace=workspace, state=state, stdout=output)
+            def confirm() -> bool:
+                output.write(
+                    "Import the proposed Application? [y/N] "
+                )
+                output.flush()
+                return input_stream.readline().strip().lower() in {
+                    "y",
+                    "yes",
+                }
+
+            return run(
+                workspace=workspace,
+                state=state,
+                stdout=output,
+                stderr=error_output,
+                sync=SyncAdapters(
+                    mailbox=workspace,
+                    classifier=classifier_factory(),
+                    application_sheet=workspace,
+                    confirm=confirm,
+                ),
+            )
     except Exception:
         error_output.write(
-            "Could not access Google Workspace. "
-            "Check your OAuth setup and try again.\n"
+            "Could not synchronize Gmail with Job Application Tracker. "
+            "Check OAuth and API configuration, then try again.\n"
         )
         return 1
 

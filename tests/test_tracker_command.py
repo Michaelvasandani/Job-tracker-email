@@ -12,6 +12,7 @@ from job_tracker_email.google_workspace import (
     TrackerSpreadsheet,
 )
 from job_tracker_email.state import SqliteTrackerState
+from job_tracker_email.sync import Application, MailboxScan
 
 
 @dataclass
@@ -32,6 +33,26 @@ class FakeGoogleWorkspace:
             CreatedSpreadsheet(spreadsheet_id, definition)
         )
         return spreadsheet_id
+
+    def find_messages(
+        self,
+        after_checkpoint: str | None,
+    ) -> MailboxScan:
+        return MailboxScan(messages=(), checkpoint=after_checkpoint or "0")
+
+    def append_application(
+        self,
+        spreadsheet_id: str,
+        application: Application,
+    ) -> None:
+        raise AssertionError("An empty mailbox cannot append an Application.")
+
+    def has_application(
+        self,
+        spreadsheet_id: str,
+        application: Application,
+    ) -> bool:
+        return False
 
 
 def test_manual_command_creates_then_reuses_one_local_tracker(
@@ -124,6 +145,26 @@ def test_command_does_not_print_secrets_from_google_errors(
                 "request failed: access_token=do-not-print-this"
             )
 
+        def find_messages(
+            self,
+            after_checkpoint: str | None,
+        ) -> MailboxScan:
+            raise AssertionError("Spreadsheet creation must fail first.")
+
+        def has_application(
+            self,
+            spreadsheet_id: str,
+            application: Application,
+        ) -> bool:
+            raise AssertionError("Spreadsheet creation must fail first.")
+
+        def append_application(
+            self,
+            spreadsheet_id: str,
+            application: Application,
+        ) -> None:
+            raise AssertionError("Spreadsheet creation must fail first.")
+
     stdout = StringIO()
     stderr = StringIO()
 
@@ -137,7 +178,7 @@ def test_command_does_not_print_secrets_from_google_errors(
     assert exit_code == 1
     assert stdout.getvalue() == ""
     assert stderr.getvalue() == (
-        "Could not access Google Workspace. "
-        "Check your OAuth setup and try again.\n"
+        "Could not synchronize Gmail with Job Application Tracker. "
+        "Check OAuth and API configuration, then try again.\n"
     )
     assert "do-not-print-this" not in stderr.getvalue()
