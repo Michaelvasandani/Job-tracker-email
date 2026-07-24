@@ -1,0 +1,24 @@
+# Python build and test artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+credentials.json
+client_secret*.json
+google-token.json
+token.json
+
+# Local tracker state
+*.sqlite
+*.sqlite3
+*.db

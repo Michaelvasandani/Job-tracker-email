@@ -1,0 +1,35 @@
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "job-tracker-email"
+version = "0.1.0"
+description = "A local, manually triggered Gmail-to-Sheets job application tracker."
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "google-api-python-client>=2.187,<3",
+    "google-auth>=2.47,<3",
+    "google-auth-oauthlib>=1.2,<2",
+]
+
+[project.scripts]
+job-tracker-email = "job_tracker_email.command:main"
+
+[project.optional-dependencies]
+dev = [
+    "mypy>=1.19,<2",
+    "pytest>=8.4,<9",
+]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
