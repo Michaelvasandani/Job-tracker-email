@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from html.parser import HTMLParser
@@ -29,11 +30,20 @@ class TrackerSpreadsheet:
     additional_tabs: tuple[str, ...]
 
 
+GoogleServiceFactory = Callable[[str, str], Any]
+
+
 class GoogleApiWorkspace:
     """Gmail and Sheets boundary backed by one installed-app OAuth grant."""
 
-    def __init__(self, config: GoogleAuthConfig) -> None:
+    def __init__(
+        self,
+        config: GoogleAuthConfig,
+        *,
+        service_factory: GoogleServiceFactory | None = None,
+    ) -> None:
         self._config = config
+        self._service_factory = service_factory
 
     def create_spreadsheet(
         self, definition: TrackerSpreadsheet
@@ -126,24 +136,18 @@ class GoogleApiWorkspace:
                 insertDataOption="INSERT_ROWS",
                 body={
                     "values": [
-                        [
-                            application.company,
-                            application.position,
-                            application.application_date,
-                            application.status,
-                            application.stage,
-                        ]
+                        self._application_row(application)
                     ]
                 },
             )
             .execute()
         )
 
-    def has_application(
+    def count_matching_applications(
         self,
         spreadsheet_id: str,
         application: Application,
-    ) -> bool:
+    ) -> int:
         service = self._build_google_service("sheets", "v4")
         response = (
             service.spreadsheets()
@@ -154,24 +158,31 @@ class GoogleApiWorkspace:
             )
             .execute()
         )
-        expected_row = [
+        expected_row = self._application_row(application)
+        return sum(
+            list(row) + [""] * (5 - len(row)) == expected_row
+            for row in response.get("values", [])
+            if isinstance(row, list) and len(row) <= 5
+        )
+
+    @staticmethod
+    def _application_row(application: Application) -> list[str]:
+        return [
             application.company,
             application.position,
             application.application_date,
             application.status,
             application.stage,
         ]
-        return any(
-            list(row) + [""] * (5 - len(row)) == expected_row
-            for row in response.get("values", [])
-            if isinstance(row, list) and len(row) <= 5
-        )
 
     def _build_google_service(
         self,
         api_name: str,
         api_version: str,
     ) -> Any:
+        if self._service_factory is not None:
+            return self._service_factory(api_name, api_version)
+
         try:
             from google.auth.transport.requests import Request
             from google.oauth2.credentials import Credentials
@@ -271,7 +282,7 @@ class GoogleApiWorkspace:
         cls,
         payload: dict[str, Any],
     ) -> tuple[list[str], list[str]]:
-        if payload.get("filename"):
+        if cls._is_attachment(payload):
             return [], []
 
         plain_parts: list[str] = []
@@ -300,6 +311,24 @@ class GoogleApiWorkspace:
             plain_parts.extend(child_plain)
             html_parts.extend(child_html)
         return plain_parts, html_parts
+
+    @staticmethod
+    def _is_attachment(payload: dict[str, Any]) -> bool:
+        if payload.get("filename") or payload.get("mimeType") == (
+            "message/rfc822"
+        ):
+            return True
+        for header in payload.get("headers", []):
+            if not isinstance(header, dict):
+                continue
+            name = str(header.get("name", "")).lower()
+            value = str(header.get("value", "")).lower()
+            if (
+                name == "content-disposition"
+                and value.split(";", 1)[0].strip() == "attachment"
+            ):
+                return True
+        return False
 
     @staticmethod
     def _decode_body(encoded_data: str) -> str:

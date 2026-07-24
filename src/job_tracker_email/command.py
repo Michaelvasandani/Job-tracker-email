@@ -21,6 +21,7 @@ from job_tracker_email.sync import (
     Application,
     ClassificationInput,
     MailboxScan,
+    PendingApplicationWrite,
 )
 
 
@@ -52,6 +53,18 @@ class TrackerState(Protocol):
 
     def has_processed_message(self, message_id: str) -> bool: ...
 
+    def get_pending_application_write(
+        self,
+        message_id: str,
+    ) -> PendingApplicationWrite | None: ...
+
+    def record_pending_application_write(
+        self,
+        message_id: str,
+        application: Application,
+        matching_rows_before_write: int,
+    ) -> None: ...
+
     def record_successful_sync(
         self,
         checkpoint: str,
@@ -74,11 +87,11 @@ class ApplicationClassifier(Protocol):
 
 
 class ApplicationSheet(Protocol):
-    def has_application(
+    def count_matching_applications(
         self,
         spreadsheet_id: str,
         application: Application,
-    ) -> bool: ...
+    ) -> int: ...
 
     def append_application(
         self,
@@ -114,15 +127,17 @@ def run(
 ) -> int:
     error_output = sys.stderr if stderr is None else stderr
     spreadsheet_id = state.get_spreadsheet_id()
-    if spreadsheet_id is not None:
-        stdout.write("Reusing Job Application Tracker.\n")
-    else:
+    if sync is None:
+        if spreadsheet_id is not None:
+            stdout.write("Reusing Job Application Tracker.\n")
+            return 0
         spreadsheet_id = workspace.create_spreadsheet(TRACKER_SPREADSHEET)
         state.save_spreadsheet_id(spreadsheet_id)
         stdout.write("Created Job Application Tracker.\n")
-
-    if sync is None:
         return 0
+
+    if spreadsheet_id is not None:
+        stdout.write("Reusing Job Application Tracker.\n")
 
     scan = sync.mailbox.find_messages(state.get_successful_checkpoint())
     messages = tuple(
@@ -132,18 +147,30 @@ def run(
     )
     proposals: list[tuple[str, Application]] = []
     for message in messages:
-        application = sync.classifier.classify(
-            ClassificationInput(
-                sender=message.sender,
-                subject=message.subject,
-                timestamp=message.timestamp,
-                normalized_body=message.normalized_body,
-            )
+        pending_write = state.get_pending_application_write(
+            message.message_id
         )
+        if pending_write is None:
+            application = sync.classifier.classify(
+                ClassificationInput(
+                    sender=message.sender,
+                    subject=message.subject,
+                    timestamp=message.timestamp,
+                    normalized_body=message.normalized_body,
+                )
+            )
+        else:
+            application = pending_write.application
         if application is not None:
             proposals.append((message.message_id, application))
 
     if not proposals:
+        if spreadsheet_id is None:
+            spreadsheet_id = workspace.create_spreadsheet(
+                TRACKER_SPREADSHEET
+            )
+            state.save_spreadsheet_id(spreadsheet_id)
+            stdout.write("Created Job Application Tracker.\n")
         state.record_successful_sync(
             scan.checkpoint,
             tuple(message.message_id for message in messages),
@@ -164,17 +191,47 @@ def run(
         stdout.write("Cancelled; no Applications imported.\n")
         return 0
 
+    if spreadsheet_id is None:
+        spreadsheet_id = workspace.create_spreadsheet(
+            TRACKER_SPREADSHEET
+        )
+        state.save_spreadsheet_id(spreadsheet_id)
+        stdout.write("Created Job Application Tracker.\n")
+
     try:
-        for _, application in proposals:
-            if sync.application_sheet.has_application(
-                spreadsheet_id,
-                application,
-            ):
-                continue
-            sync.application_sheet.append_application(
-                spreadsheet_id,
-                application,
+        for message_id, application in proposals:
+            pending_write = state.get_pending_application_write(
+                message_id
             )
+            if pending_write is None:
+                matching_rows = (
+                    sync.application_sheet.count_matching_applications(
+                        spreadsheet_id,
+                        application,
+                    )
+                )
+                state.record_pending_application_write(
+                    message_id,
+                    application,
+                    matching_rows,
+                )
+                should_append = True
+            else:
+                current_matching_rows = (
+                    sync.application_sheet.count_matching_applications(
+                        spreadsheet_id,
+                        application,
+                    )
+                )
+                should_append = (
+                    current_matching_rows
+                    <= pending_write.matching_rows_before_write
+                )
+            if should_append:
+                sync.application_sheet.append_application(
+                    spreadsheet_id,
+                    application,
+                )
     except Exception:
         error_output.write(
             "Could not update Job Application Tracker. Try again.\n"

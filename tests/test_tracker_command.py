@@ -47,12 +47,12 @@ class FakeGoogleWorkspace:
     ) -> None:
         raise AssertionError("An empty mailbox cannot append an Application.")
 
-    def has_application(
+    def count_matching_applications(
         self,
         spreadsheet_id: str,
         application: Application,
-    ) -> bool:
-        return False
+    ) -> int:
+        return 0
 
 
 def test_manual_command_creates_then_reuses_one_local_tracker(
@@ -151,11 +151,11 @@ def test_command_does_not_print_secrets_from_google_errors(
         ) -> MailboxScan:
             raise AssertionError("Spreadsheet creation must fail first.")
 
-        def has_application(
+        def count_matching_applications(
             self,
             spreadsheet_id: str,
             application: Application,
-        ) -> bool:
+        ) -> int:
             raise AssertionError("Spreadsheet creation must fail first.")
 
         def append_application(

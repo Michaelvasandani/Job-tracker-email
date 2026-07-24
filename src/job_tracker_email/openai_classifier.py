@@ -43,14 +43,24 @@ CLASSIFICATION_SCHEMA: dict[str, Any] = {
 class OpenAIApplicationClassifier:
     """OpenAI structured-output boundary for one sanitized email."""
 
-    def __init__(self, model: str = "gpt-5.6-luna") -> None:
+    def __init__(
+        self,
+        model: str = "gpt-5.6-luna",
+        *,
+        client: Any | None = None,
+    ) -> None:
         self._model = model
+        self._provided_client = client
 
     def classify(
         self,
         message: ClassificationInput,
     ) -> Application | None:
-        client = self._client()
+        client = (
+            self._provided_client
+            if self._provided_client is not None
+            else self._create_client()
+        )
         response = client.responses.create(
             model=self._model,
             reasoning={"effort": "none"},
@@ -93,7 +103,7 @@ class OpenAIApplicationClassifier:
         )
 
     @staticmethod
-    def _client() -> Any:
+    def _create_client() -> Any:
         try:
             from openai import OpenAI
         except ImportError as error:

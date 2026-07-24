@@ -4,6 +4,8 @@ import sqlite3
 from pathlib import Path
 from types import TracebackType
 
+from job_tracker_email.sync import Application, PendingApplicationWrite
+
 
 class SqliteTrackerState:
     def __init__(self, database_path: Path) -> None:
@@ -21,6 +23,19 @@ class SqliteTrackerState:
             """
             CREATE TABLE IF NOT EXISTS processed_messages (
                 gmail_message_id TEXT PRIMARY KEY
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending_application_writes (
+                gmail_message_id TEXT PRIMARY KEY,
+                company TEXT NOT NULL,
+                position TEXT NOT NULL,
+                application_date TEXT NOT NULL,
+                status TEXT NOT NULL,
+                stage TEXT NOT NULL,
+                matching_rows_before_write INTEGER NOT NULL
             )
             """
         )
@@ -69,6 +84,78 @@ class SqliteTrackerState:
         ).fetchone()
         return row is not None
 
+    def get_pending_application_write(
+        self,
+        message_id: str,
+    ) -> PendingApplicationWrite | None:
+        row = self._connection.execute(
+            """
+            SELECT
+                company,
+                position,
+                application_date,
+                status,
+                stage,
+                matching_rows_before_write
+            FROM pending_application_writes
+            WHERE gmail_message_id = ?
+            """,
+            (message_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        if row[3] != "Active":
+            raise RuntimeError("Pending Application has an invalid Status.")
+        return PendingApplicationWrite(
+            application=Application(
+                company=str(row[0]),
+                position=str(row[1]),
+                application_date=str(row[2]),
+                status="Active",
+                stage=str(row[4]),
+            ),
+            matching_rows_before_write=int(row[5]),
+        )
+
+    def record_pending_application_write(
+        self,
+        message_id: str,
+        application: Application,
+        matching_rows_before_write: int,
+    ) -> None:
+        self._connection.execute(
+            """
+            INSERT INTO pending_application_writes (
+                gmail_message_id,
+                company,
+                position,
+                application_date,
+                status,
+                stage,
+                matching_rows_before_write
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(gmail_message_id) DO UPDATE SET
+                company = excluded.company,
+                position = excluded.position,
+                application_date = excluded.application_date,
+                status = excluded.status,
+                stage = excluded.stage,
+                matching_rows_before_write =
+                    excluded.matching_rows_before_write
+            """,
+            (
+                message_id,
+                application.company,
+                application.position,
+                application.application_date,
+                application.status,
+                application.stage,
+                matching_rows_before_write,
+            ),
+        )
+        self._connection.commit()
+
     def record_successful_sync(
         self,
         checkpoint: str,
@@ -79,6 +166,13 @@ class SqliteTrackerState:
                 """
                 INSERT OR IGNORE INTO processed_messages (gmail_message_id)
                 VALUES (?)
+                """,
+                ((message_id,) for message_id in message_ids),
+            )
+            self._connection.executemany(
+                """
+                DELETE FROM pending_application_writes
+                WHERE gmail_message_id = ?
                 """,
                 ((message_id,) for message_id in message_ids),
             )

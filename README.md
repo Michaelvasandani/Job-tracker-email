@@ -64,8 +64,9 @@ The equivalent environment variables are
 Raw email bodies are not written to the spreadsheet, SQLite state, or normal
 console output. OpenAI Responses are requested with server-side storage
 disabled. Spreadsheet-write errors leave the checkpoint unchanged so the
-command can be retried; an exact row check prevents a duplicate after an
-ambiguous write result.
+command can be retried. Per-message pending-write bookkeeping distinguishes a
+retry from a separate submission and prevents duplicates after an ambiguous
+write result.
 
 For a live end-to-end verification, follow the
 [manual smoke test](docs/manual-smoke-test.md).

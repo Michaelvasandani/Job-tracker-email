@@ -34,3 +34,9 @@ class Application:
     application_date: str
     status: Literal["Active"] = "Active"
     stage: str = ""
+
+
+@dataclass(frozen=True)
+class PendingApplicationWrite:
+    application: Application
+    matching_rows_before_write: int
