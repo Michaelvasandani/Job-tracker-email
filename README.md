@@ -18,7 +18,7 @@ classification and synchronization are planned in the later tickets under
 The command requests only these Google permissions:
 
 - read-only Gmail access
-- permission to create and maintain Google spreadsheets
+- per-file permission to create and maintain the app-created tracker
 
 ## Install
 

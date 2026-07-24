@@ -6,8 +6,8 @@ from pathlib import Path
 
 from job_tracker_email.command import main, run
 from job_tracker_email.google_workspace import (
+    DRIVE_FILE_SCOPE,
     GMAIL_READONLY_SCOPE,
-    SHEETS_SCOPE,
     GoogleAuthConfig,
     TrackerSpreadsheet,
 )
@@ -107,7 +107,7 @@ def test_installed_command_requests_only_required_google_permissions(
         GoogleAuthConfig(
             client_secrets_path=tmp_path / "credentials.json",
             token_path=tmp_path / "local-data" / "google-token.json",
-            scopes=(GMAIL_READONLY_SCOPE, SHEETS_SCOPE),
+            scopes=(GMAIL_READONLY_SCOPE, DRIVE_FILE_SCOPE),
         )
     ]
     assert (tmp_path / "local-data" / "tracker.sqlite3").exists()

@@ -6,14 +6,14 @@ from typing import Any
 
 
 GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
-SHEETS_SCOPE = "https://www.googleapis.com/auth/spreadsheets"
+DRIVE_FILE_SCOPE = "https://www.googleapis.com/auth/drive.file"
 
 
 @dataclass(frozen=True)
 class GoogleAuthConfig:
     client_secrets_path: Path
     token_path: Path
-    scopes: tuple[str, ...] = (GMAIL_READONLY_SCOPE, SHEETS_SCOPE)
+    scopes: tuple[str, ...] = (GMAIL_READONLY_SCOPE, DRIVE_FILE_SCOPE)
 
 
 @dataclass(frozen=True)
