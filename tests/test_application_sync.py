@@ -8,6 +8,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
+import pytest
+
 from job_tracker_email.command import SyncAdapters, main, run
 from job_tracker_email.google_workspace import (
     GoogleApiWorkspace,
@@ -21,6 +23,8 @@ from job_tracker_email.sync import (
     ClassificationInput,
     GmailMessage,
     MailboxScan,
+    NeedsReview,
+    ReviewProposal,
 )
 from job_tracker_email.state import SqliteTrackerState
 
@@ -34,11 +38,17 @@ class FakeMailbox:
 
 
 class RecordingClassifier:
-    def __init__(self, result: Application) -> None:
+    def __init__(
+        self,
+        result: Application | ReviewProposal | None,
+    ) -> None:
         self.result = result
         self.received: list[ClassificationInput] = []
 
-    def classify(self, message: ClassificationInput) -> Application | None:
+    def classify(
+        self,
+        message: ClassificationInput,
+    ) -> Application | ReviewProposal | None:
         self.received.append(message)
         return self.result
 
@@ -46,6 +56,7 @@ class RecordingClassifier:
 class RecordingApplicationSheet:
     def __init__(self) -> None:
         self.rows: list[tuple[str, Application]] = []
+        self.review_rows: list[tuple[str, NeedsReview]] = []
 
     def append_application(
         self,
@@ -60,6 +71,20 @@ class RecordingApplicationSheet:
         application: Application,
     ) -> int:
         return self.rows.count((spreadsheet_id, application))
+
+    def append_needs_review(
+        self,
+        spreadsheet_id: str,
+        review: NeedsReview,
+    ) -> None:
+        self.review_rows.append((spreadsheet_id, review))
+
+    def count_matching_needs_review(
+        self,
+        spreadsheet_id: str,
+        review: NeedsReview,
+    ) -> int:
+        return self.review_rows.count((spreadsheet_id, review))
 
 
 class FailOnceApplicationSheet(RecordingApplicationSheet):
@@ -381,6 +406,262 @@ def test_rejecting_preview_changes_neither_sheet_nor_checkpoint(
     )
     assert raw_body not in stdout.getvalue()
     assert raw_body.encode() not in state_path.read_bytes()
+
+
+def test_confirmed_review_proposal_records_gmail_context_without_body(
+    tmp_path: Path,
+) -> None:
+    raw_body = "We would like to discuss your application for a role."
+    mailbox = FakeMailbox(
+        MailboxScan(
+            messages=(
+                GmailMessage(
+                    message_id="uncertain-hiring-message",
+                    sender="Hiring Team <hiring@example.com>",
+                    subject="Let's talk about your application",
+                    timestamp="2026-07-24T11:00:00Z",
+                    normalized_body=raw_body,
+                ),
+            ),
+            checkpoint="checkpoint-review",
+        )
+    )
+    classifier = RecordingClassifier(
+        ReviewProposal(
+            reason="The application date cannot be established."
+        )
+    )
+    sheet = RecordingApplicationSheet()
+    stdout = StringIO()
+    state_path = tmp_path / "tracker.sqlite3"
+
+    with SqliteTrackerState(state_path) as state:
+        state.save_spreadsheet_id("spreadsheet-review")
+
+        def approve_after_observing_preview() -> bool:
+            assert "Proposed Needs Review items:" in stdout.getvalue()
+            assert raw_body not in stdout.getvalue()
+            assert sheet.rows == []
+            assert sheet.review_rows == []
+            return True
+
+        exit_code = run(
+            workspace=ExistingTracker(),
+            state=state,
+            stdout=stdout,
+            sync=SyncAdapters(
+                mailbox=mailbox,
+                classifier=classifier,
+                application_sheet=sheet,
+                confirm=approve_after_observing_preview,
+            ),
+        )
+
+        assert exit_code == 0
+        assert state.has_processed_message("uncertain-hiring-message")
+        assert raw_body.encode() not in state_path.read_bytes()
+        assert sheet.review_rows == [
+            (
+                "spreadsheet-review",
+                NeedsReview(
+                    email_date="2026-07-24",
+                    sender="Hiring Team <hiring@example.com>",
+                    subject="Let's talk about your application",
+                    gmail_link=(
+                        "https://mail.google.com/mail/u/0/#all/"
+                        "uncertain-hiring-message"
+                    ),
+                    reason="The application date cannot be established.",
+                ),
+            )
+        ]
+
+        sheet.review_rows.clear()
+        rerun_exit_code = run(
+            workspace=ExistingTracker(),
+            state=state,
+            stdout=StringIO(),
+            sync=SyncAdapters(
+                mailbox=mailbox,
+                classifier=classifier,
+                application_sheet=sheet,
+                confirm=lambda: True,
+            ),
+        )
+
+    assert rerun_exit_code == 0
+    assert sheet.rows == []
+    assert sheet.review_rows == []
+    assert raw_body not in stdout.getvalue()
+
+
+def test_ignored_message_advances_checkpoint_without_a_proposal(
+    tmp_path: Path,
+) -> None:
+    mailbox = FakeMailbox(
+        MailboxScan(
+            messages=(
+                GmailMessage(
+                    message_id="saved-job-reminder",
+                    sender="Job Board <alerts@example.com>",
+                    subject="A saved job is waiting",
+                    timestamp="2026-07-24T12:00:00Z",
+                    normalized_body="A job you saved is still available.",
+                ),
+            ),
+            checkpoint="checkpoint-ignored",
+        )
+    )
+    sheet = RecordingApplicationSheet()
+
+    with SqliteTrackerState(tmp_path / "tracker.sqlite3") as state:
+        state.save_spreadsheet_id("spreadsheet-ignored")
+        exit_code = run(
+            workspace=ExistingTracker(),
+            state=state,
+            stdout=StringIO(),
+            sync=SyncAdapters(
+                mailbox=mailbox,
+                classifier=RecordingClassifier(None),
+                application_sheet=sheet,
+                confirm=lambda: (_ for _ in ()).throw(
+                    AssertionError("Ignored mail needs no confirmation.")
+                ),
+            ),
+        )
+
+        assert state.get_successful_checkpoint() == "checkpoint-ignored"
+        assert state.has_processed_message("saved-job-reminder")
+
+    assert exit_code == 0
+    assert sheet.rows == []
+    assert sheet.review_rows == []
+
+
+@pytest.mark.parametrize(
+    ("message_id", "subject", "outcome", "requires_confirmation"),
+    [
+        pytest.param(
+            "generic-job-alert",
+            "New jobs for you",
+            None,
+            False,
+            id="generic-job-alert-is-ignored",
+        ),
+        pytest.param(
+            "recruiter-outreach",
+            "Interested in a role?",
+            None,
+            False,
+            id="pre-application-recruiter-outreach-is-ignored",
+        ),
+        pytest.param(
+            "incomplete-application",
+            "Finish your application",
+            None,
+            False,
+            id="unsubmitted-application-is-ignored",
+        ),
+        pytest.param(
+            "unknown-company",
+            "We received your application",
+            ReviewProposal("The prospective employer is unclear."),
+            True,
+            id="uncertain-company-is-reviewed",
+        ),
+        pytest.param(
+            "unknown-position",
+            "Interview invitation",
+            ReviewProposal("The Position is unclear."),
+            True,
+            id="uncertain-position-is-reviewed",
+        ),
+        pytest.param(
+            "unknown-submission-date",
+            "Next interview steps",
+            ReviewProposal("The Application Date is not established."),
+            True,
+            id="later-hiring-message-is-reviewed",
+        ),
+        pytest.param(
+            "ambiguous-application",
+            "Update on your application",
+            ReviewProposal("The Application identity is ambiguous."),
+            True,
+            id="uncertain-application-identity-is-reviewed",
+        ),
+        pytest.param(
+            "uncertain-status",
+            "Good news about your application",
+            ReviewProposal("The Status is uncertain."),
+            True,
+            id="uncertain-status-is-reviewed",
+        ),
+        pytest.param(
+            "non-english-message",
+            "Actualización de su solicitud",
+            ReviewProposal("The language is unsupported."),
+            True,
+            id="unsupported-language-is-reviewed",
+        ),
+        pytest.param(
+            "alternate-position",
+            "Consider a different position",
+            ReviewProposal("No submission evidence supports this Position."),
+            True,
+            id="alternate-position-is-reviewed",
+        ),
+    ],
+)
+def test_conservative_outcomes_never_automatically_create_an_application(
+    tmp_path: Path,
+    message_id: str,
+    subject: str,
+    outcome: ReviewProposal | None,
+    requires_confirmation: bool,
+) -> None:
+    mailbox = FakeMailbox(
+        MailboxScan(
+            messages=(
+                GmailMessage(
+                    message_id=message_id,
+                    sender="Mailbox Sender <sender@example.com>",
+                    subject=subject,
+                    timestamp="2026-07-24T13:00:00Z",
+                    normalized_body="Representative mailbox scenario.",
+                ),
+            ),
+            checkpoint=f"checkpoint-{message_id}",
+        )
+    )
+    sheet = RecordingApplicationSheet()
+    confirmations = 0
+
+    def confirm() -> bool:
+        nonlocal confirmations
+        confirmations += 1
+        return True
+
+    with SqliteTrackerState(tmp_path / "tracker.sqlite3") as state:
+        state.save_spreadsheet_id("spreadsheet-conservative-outcomes")
+        exit_code = run(
+            workspace=ExistingTracker(),
+            state=state,
+            stdout=StringIO(),
+            sync=SyncAdapters(
+                mailbox=mailbox,
+                classifier=RecordingClassifier(outcome),
+                application_sheet=sheet,
+                confirm=confirm,
+            ),
+        )
+
+        assert state.has_processed_message(message_id)
+
+    assert exit_code == 0
+    assert confirmations == int(requires_confirmation)
+    assert sheet.rows == []
+    assert len(sheet.review_rows) == int(requires_confirmation)
 
 
 def test_installed_command_syncs_through_controllable_boundaries(

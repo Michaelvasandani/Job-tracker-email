@@ -14,7 +14,7 @@ from job_tracker_email.google_workspace import (
     TrackerSpreadsheet,
 )
 from job_tracker_email.state import SqliteTrackerState
-from job_tracker_email.sync import Application, MailboxScan
+from job_tracker_email.sync import Application, MailboxScan, NeedsReview
 
 
 @dataclass
@@ -55,6 +55,20 @@ class FakeGoogleWorkspace:
         application: Application,
     ) -> int:
         return 0
+
+    def count_matching_needs_review(
+        self,
+        spreadsheet_id: str,
+        review: NeedsReview,
+    ) -> int:
+        return 0
+
+    def append_needs_review(
+        self,
+        spreadsheet_id: str,
+        review: NeedsReview,
+    ) -> None:
+        raise AssertionError("An empty mailbox cannot append Needs Review.")
 
 
 class FakeGoogleRequest:
@@ -214,6 +228,15 @@ def test_sheets_adapter_creates_formula_driven_stats_and_status_colors(
             }
         ]
     ] * 4
+    review_sheet = next(
+        sheet
+        for sheet in sheet_definitions
+        if sheet["properties"]["title"] == "Needs Review"
+    )
+    assert [
+        cell["userEnteredValue"]["stringValue"]
+        for cell in review_sheet["data"][0]["rowData"][0]["values"]
+    ] == ["Email Date", "Sender", "Subject", "Gmail Link", "Reason"]
 
 
 def test_installed_command_requests_only_required_google_permissions(
@@ -278,6 +301,20 @@ def test_command_does_not_print_secrets_from_google_errors(
             self,
             spreadsheet_id: str,
             application: Application,
+        ) -> None:
+            raise AssertionError("Spreadsheet creation must fail first.")
+
+        def count_matching_needs_review(
+            self,
+            spreadsheet_id: str,
+            review: NeedsReview,
+        ) -> int:
+            raise AssertionError("Spreadsheet creation must fail first.")
+
+        def append_needs_review(
+            self,
+            spreadsheet_id: str,
+            review: NeedsReview,
         ) -> None:
             raise AssertionError("Spreadsheet creation must fail first.")
 

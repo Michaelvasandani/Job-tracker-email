@@ -4,18 +4,32 @@ import json
 from datetime import date
 from typing import Any
 
-from job_tracker_email.sync import Application, ClassificationInput
+from job_tracker_email.sync import (
+    Application,
+    ClassificationInput,
+    ReviewProposal,
+)
 
 
 CLASSIFICATION_INSTRUCTIONS = """
-Classify one English-language email for a private job-application tracker.
+Classify one email for a private job-application tracker. If the email is not
+clearly English, return needs_review rather than inferring its meaning.
 Return new_application only when the message directly confirms that the user
 submitted or entered candidacy for a position. Company is the prospective
 employer, never an applicant-tracking platform or incidental sender. Position
 is the human-readable role title with a meaningful level, excluding location,
 department, and requisition identifiers. Application date must come from
-direct submission evidence. Return other with empty derived fields when the
-message is irrelevant, unclear, unsupported, or lacks any required fact.
+direct submission evidence.
+
+Return ignore for generic job alerts, saved-job reminders, recruiter outreach
+before an application, and messages about started, saved, incomplete, or
+unsubmitted applications. Return needs_review for every plausible candidacy
+message whose Company, Position, Application Date, Application identity, or
+Status is uncertain; for later hiring-process messages without reliable
+submission-date evidence; for unsupported or unclear language; and for an
+alternate Position without separate submission or candidacy evidence. Give a
+concise reason for needs_review. Do not use a later hiring-message date as an
+Application Date. Ignore and new_application must have an empty reason.
 """.strip()
 
 
@@ -24,17 +38,19 @@ CLASSIFICATION_SCHEMA: dict[str, Any] = {
     "properties": {
         "kind": {
             "type": "string",
-            "enum": ["new_application", "other"],
+            "enum": ["new_application", "needs_review", "ignore"],
         },
         "company": {"type": "string"},
         "position": {"type": "string"},
         "application_date": {"type": "string"},
+        "reason": {"type": "string"},
     },
     "required": [
         "kind",
         "company",
         "position",
         "application_date",
+        "reason",
     ],
     "additionalProperties": False,
 }
@@ -55,7 +71,7 @@ class OpenAIApplicationClassifier:
     def classify(
         self,
         message: ClassificationInput,
-    ) -> Application | None:
+    ) -> Application | ReviewProposal | None:
         client = (
             self._provided_client
             if self._provided_client is not None
@@ -85,8 +101,17 @@ class OpenAIApplicationClassifier:
             store=False,
         )
         result = json.loads(response.output_text)
-        if result["kind"] != "new_application":
+        if result["kind"] == "ignore":
             return None
+        if result["kind"] == "needs_review":
+            reason = str(result["reason"]).strip()
+            if not reason:
+                raise RuntimeError(
+                    "OpenAI classification omitted a review reason."
+                )
+            return ReviewProposal(reason=reason)
+        if result["kind"] != "new_application":
+            raise RuntimeError("OpenAI classification returned an unknown kind.")
 
         company = str(result["company"]).strip()
         position = str(result["position"]).strip()

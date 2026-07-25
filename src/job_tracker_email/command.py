@@ -22,6 +22,8 @@ from job_tracker_email.sync import (
     ClassificationInput,
     MailboxScan,
     PendingApplicationWrite,
+    NeedsReview,
+    ReviewProposal,
 )
 
 
@@ -83,7 +85,7 @@ class ApplicationClassifier(Protocol):
     def classify(
         self,
         message: ClassificationInput,
-    ) -> Application | None: ...
+    ) -> Application | ReviewProposal | None: ...
 
 
 class ApplicationSheet(Protocol):
@@ -97,6 +99,18 @@ class ApplicationSheet(Protocol):
         self,
         spreadsheet_id: str,
         application: Application,
+    ) -> None: ...
+
+    def count_matching_needs_review(
+        self,
+        spreadsheet_id: str,
+        review: NeedsReview,
+    ) -> int: ...
+
+    def append_needs_review(
+        self,
+        spreadsheet_id: str,
+        review: NeedsReview,
     ) -> None: ...
 
 
@@ -145,13 +159,14 @@ def run(
         for message in scan.messages
         if not state.has_processed_message(message.message_id)
     )
-    proposals: list[tuple[str, Application]] = []
+    application_proposals: list[tuple[str, Application]] = []
+    review_proposals: list[tuple[str, NeedsReview]] = []
     for message in messages:
         pending_write = state.get_pending_application_write(
             message.message_id
         )
         if pending_write is None:
-            application = sync.classifier.classify(
+            outcome = sync.classifier.classify(
                 ClassificationInput(
                     sender=message.sender,
                     subject=message.subject,
@@ -160,11 +175,27 @@ def run(
                 )
             )
         else:
-            application = pending_write.application
-        if application is not None:
-            proposals.append((message.message_id, application))
+            outcome = pending_write.application
+        if isinstance(outcome, Application):
+            application_proposals.append((message.message_id, outcome))
+        elif isinstance(outcome, ReviewProposal):
+            review_proposals.append(
+                (
+                    message.message_id,
+                    NeedsReview(
+                        email_date=message.timestamp[:10],
+                        sender=message.sender,
+                        subject=message.subject,
+                        gmail_link=(
+                            "https://mail.google.com/mail/u/0/#all/"
+                            f"{message.message_id}"
+                        ),
+                        reason=outcome.reason,
+                    ),
+                )
+            )
 
-    if not proposals:
+    if not application_proposals and not review_proposals:
         if spreadsheet_id is None:
             spreadsheet_id = workspace.create_spreadsheet(
                 TRACKER_SPREADSHEET
@@ -177,15 +208,26 @@ def run(
         )
         return 0
 
-    stdout.write("Proposed Applications:\n")
-    for _, application in proposals:
-        stdout.write(
-            f"  Company: {application.company}\n"
-            f"  Position: {application.position}\n"
-            f"  Application Date: {application.application_date}\n"
-            f"  Status: {application.status}\n"
-            f"  Stage: {application.stage or '(blank)'}\n"
-        )
+    if application_proposals:
+        stdout.write("Proposed Applications:\n")
+        for _, application in application_proposals:
+            stdout.write(
+                f"  Company: {application.company}\n"
+                f"  Position: {application.position}\n"
+                f"  Application Date: {application.application_date}\n"
+                f"  Status: {application.status}\n"
+                f"  Stage: {application.stage or '(blank)'}\n"
+            )
+    if review_proposals:
+        stdout.write("Proposed Needs Review items:\n")
+        for _, review in review_proposals:
+            stdout.write(
+                f"  Email Date: {review.email_date}\n"
+                f"  Sender: {review.sender}\n"
+                f"  Subject: {review.subject}\n"
+                f"  Gmail Link: {review.gmail_link}\n"
+                f"  Reason: {review.reason}\n"
+            )
 
     if not sync.confirm():
         stdout.write("Cancelled; no Applications imported.\n")
@@ -199,7 +241,7 @@ def run(
         stdout.write("Created Job Application Tracker.\n")
 
     try:
-        for message_id, application in proposals:
+        for message_id, application in application_proposals:
             pending_write = state.get_pending_application_write(
                 message_id
             )
@@ -231,6 +273,18 @@ def run(
                 sync.application_sheet.append_application(
                     spreadsheet_id,
                     application,
+                )
+        for _, review in review_proposals:
+            if (
+                sync.application_sheet.count_matching_needs_review(
+                    spreadsheet_id,
+                    review,
+                )
+                == 0
+            ):
+                sync.application_sheet.append_needs_review(
+                    spreadsheet_id,
+                    review,
                 )
     except Exception:
         error_output.write(

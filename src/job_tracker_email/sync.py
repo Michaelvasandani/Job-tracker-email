@@ -37,6 +37,22 @@ class Application:
 
 
 @dataclass(frozen=True)
+class ReviewProposal:
+    """Classifier result for candidacy evidence that needs manual review."""
+
+    reason: str
+
+
+@dataclass(frozen=True)
+class NeedsReview:
+    email_date: str
+    sender: str
+    subject: str
+    gmail_link: str
+    reason: str
+
+
+@dataclass(frozen=True)
 class PendingApplicationWrite:
     application: Application
     matching_rows_before_write: int

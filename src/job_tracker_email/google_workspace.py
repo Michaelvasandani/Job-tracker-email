@@ -9,7 +9,12 @@ from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
-from job_tracker_email.sync import Application, GmailMessage, MailboxScan
+from job_tracker_email.sync import (
+    Application,
+    GmailMessage,
+    MailboxScan,
+    NeedsReview,
+)
 
 
 GMAIL_READONLY_SCOPE = "https://www.googleapis.com/auth/gmail.readonly"
@@ -125,22 +130,10 @@ class GoogleApiWorkspace:
         spreadsheet_id: str,
         application: Application,
     ) -> None:
-        service = self._build_google_service("sheets", "v4")
-        (
-            service.spreadsheets()
-            .values()
-            .append(
-                spreadsheetId=spreadsheet_id,
-                range="Applications!A:E",
-                valueInputOption="RAW",
-                insertDataOption="INSERT_ROWS",
-                body={
-                    "values": [
-                        self._application_row(application)
-                    ]
-                },
-            )
-            .execute()
+        self._append_row(
+            spreadsheet_id,
+            "Applications!A:E",
+            self._application_row(application),
         )
 
     def count_matching_applications(
@@ -148,17 +141,70 @@ class GoogleApiWorkspace:
         spreadsheet_id: str,
         application: Application,
     ) -> int:
+        return self._count_matching_rows(
+            spreadsheet_id,
+            "Applications!A2:E",
+            self._application_row(application),
+        )
+
+    def append_needs_review(
+        self,
+        spreadsheet_id: str,
+        review: NeedsReview,
+    ) -> None:
+        self._append_row(
+            spreadsheet_id,
+            "Needs Review!A:E",
+            self._needs_review_row(review),
+        )
+
+    def count_matching_needs_review(
+        self,
+        spreadsheet_id: str,
+        review: NeedsReview,
+    ) -> int:
+        return self._count_matching_rows(
+            spreadsheet_id,
+            "Needs Review!A2:E",
+            self._needs_review_row(review),
+        )
+
+    def _append_row(
+        self,
+        spreadsheet_id: str,
+        cell_range: str,
+        row: list[str],
+    ) -> None:
+        service = self._build_google_service("sheets", "v4")
+        (
+            service.spreadsheets()
+            .values()
+            .append(
+                spreadsheetId=spreadsheet_id,
+                range=cell_range,
+                valueInputOption="RAW",
+                insertDataOption="INSERT_ROWS",
+                body={"values": [row]},
+            )
+            .execute()
+        )
+
+    def _count_matching_rows(
+        self,
+        spreadsheet_id: str,
+        cell_range: str,
+        expected_row: list[str],
+    ) -> int:
         service = self._build_google_service("sheets", "v4")
         response = (
             service.spreadsheets()
             .values()
             .get(
                 spreadsheetId=spreadsheet_id,
-                range="Applications!A2:E",
+                range=cell_range,
             )
             .execute()
         )
-        expected_row = self._application_row(application)
         return sum(
             list(row) + [""] * (5 - len(row)) == expected_row
             for row in response.get("values", [])
@@ -173,6 +219,16 @@ class GoogleApiWorkspace:
             application.application_date,
             application.status,
             application.stage,
+        ]
+
+    @staticmethod
+    def _needs_review_row(review: NeedsReview) -> list[str]:
+        return [
+            review.email_date,
+            review.sender,
+            review.subject,
+            review.gmail_link,
+            review.reason,
         ]
 
     def _build_google_service(
@@ -391,6 +447,23 @@ class GoogleApiWorkspace:
 
 
 def _sheet_for_tab(tab: str) -> dict[str, Any]:
+    if tab == "Needs Review":
+        return {
+            "properties": {"title": tab},
+            "data": [
+                {
+                    "rowData": [
+                        _header_row(
+                            "Email Date",
+                            "Sender",
+                            "Subject",
+                            "Gmail Link",
+                            "Reason",
+                        )
+                    ]
+                }
+            ],
+        }
     if tab != "Stats":
         return {"properties": {"title": tab}}
     return {
@@ -431,6 +504,15 @@ def _stats_row(label: str, value: str) -> dict[str, Any]:
         "values": [
             {"userEnteredValue": {"stringValue": label}},
             {"userEnteredValue": {value_type: value}},
+        ]
+    }
+
+
+def _header_row(*columns: str) -> dict[str, Any]:
+    return {
+        "values": [
+            {"userEnteredValue": {"stringValue": column}}
+            for column in columns
         ]
     }
 
