@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import base64
 import json
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
+from datetime import date
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -35,8 +36,16 @@ from job_tracker_email.state import SqliteTrackerState
 @dataclass
 class FakeMailbox:
     scan: MailboxScan
+    scan_requests: list[tuple[str | None, date | None]] = field(
+        default_factory=list
+    )
 
-    def find_messages(self, after_checkpoint: str | None) -> MailboxScan:
+    def find_messages(
+        self,
+        after_checkpoint: str | None,
+        start_date: date | None = None,
+    ) -> MailboxScan:
+        self.scan_requests.append((after_checkpoint, start_date))
         return self.scan
 
 
@@ -216,6 +225,32 @@ class FakeGmailService:
         return self._users
 
 
+class RecordingGmailMessages:
+    def __init__(self, messages: dict[str, dict[str, Any]]) -> None:
+        self._messages = messages
+        self.list_requests: list[dict[str, Any]] = []
+
+    def list(self, **arguments: Any) -> FakeGoogleRequest:
+        self.list_requests.append(arguments)
+        return FakeGoogleRequest(
+            {"messages": [{"id": message_id} for message_id in self._messages]}
+        )
+
+    def get(self, **arguments: Any) -> FakeGoogleRequest:
+        return FakeGoogleRequest(self._messages[arguments["id"]])
+
+
+class RecordingGmailService:
+    def __init__(self, messages: dict[str, dict[str, Any]]) -> None:
+        self._messages = RecordingGmailMessages(messages)
+
+    def users(self) -> RecordingGmailService:
+        return self
+
+    def messages(self) -> RecordingGmailMessages:
+        return self._messages
+
+
 class FakeOpenAIResponses:
     def __init__(self) -> None:
         self.requests: list[dict[str, Any]] = []
@@ -248,12 +283,18 @@ class SyncingWorkspace(RecordingApplicationSheet):
         super().__init__()
         self.scan = scan
         self.created = False
+        self.scan_requests: list[tuple[str | None, date | None]] = []
 
     def create_spreadsheet(self, definition: object) -> str:
         self.created = True
         return "spreadsheet-from-main"
 
-    def find_messages(self, after_checkpoint: str | None) -> MailboxScan:
+    def find_messages(
+        self,
+        after_checkpoint: str | None,
+        start_date: date | None = None,
+    ) -> MailboxScan:
+        self.scan_requests.append((after_checkpoint, start_date))
         return self.scan
 
 
@@ -1535,3 +1576,217 @@ def test_real_openai_adapter_returns_a_conclusive_status_update() -> None:
         position="Software Engineer",
         status="Rejected",
     )
+
+
+def test_initial_gmail_scan_searches_all_eligible_locations_in_time_order(
+    tmp_path: Path,
+) -> None:
+    gmail_service = RecordingGmailService(
+        {
+            "later": {
+                "internalDate": "1767355200000",
+                "payload": {
+                    "headers": [
+                        {"name": "From", "value": "jobs@example.com"},
+                        {"name": "Subject", "value": "Later"},
+                    ]
+                },
+            },
+            "earlier": {
+                "internalDate": "1767268800000",
+                "payload": {
+                    "headers": [
+                        {"name": "From", "value": "jobs@example.com"},
+                        {"name": "Subject", "value": "Earlier"},
+                    ]
+                },
+            },
+        }
+    )
+    mailbox = GoogleApiWorkspace(
+        GoogleAuthConfig(
+            client_secrets_path=tmp_path / "credentials.json",
+            token_path=tmp_path / "token.json",
+        ),
+        service_factory=lambda api_name, api_version: gmail_service,
+    )
+
+    scan = mailbox.find_messages(None)
+
+    assert gmail_service.messages().list_requests == [
+        {
+            "userId": "me",
+            "q": "in:anywhere -in:spam -in:trash",
+            "maxResults": 500,
+        }
+    ]
+    assert [message.message_id for message in scan.messages] == [
+        "earlier",
+        "later",
+    ]
+
+
+def test_initial_command_passes_start_date_to_mailbox(
+    tmp_path: Path,
+) -> None:
+    workspace = SyncingWorkspace(MailboxScan(messages=(), checkpoint="0"))
+
+    exit_code = main(
+        [
+            "--data-dir",
+            str(tmp_path),
+            "--start-date",
+            "2026-01-02",
+        ],
+        workspace_factory=lambda config: workspace,
+        classifier_factory=lambda: RecordingClassifier(None),
+        stdout=StringIO(),
+    )
+
+    assert exit_code == 0
+    assert workspace.scan_requests == [(None, date(2026, 1, 2))]
+
+
+def test_start_date_filters_earlier_gmail_history(tmp_path: Path) -> None:
+    gmail_service = RecordingGmailService({})
+    mailbox = GoogleApiWorkspace(
+        GoogleAuthConfig(
+            client_secrets_path=tmp_path / "credentials.json",
+            token_path=tmp_path / "token.json",
+        ),
+        service_factory=lambda api_name, api_version: gmail_service,
+    )
+
+    mailbox.find_messages(None, start_date=date(2026, 1, 2))
+
+    assert gmail_service.messages().list_requests[0]["q"] == (
+        "in:anywhere -in:spam -in:trash after:2026/01/02"
+    )
+
+
+def test_exactly_500_unprocessed_messages_are_classified(
+    tmp_path: Path,
+) -> None:
+    messages = tuple(
+        GmailMessage(
+            message_id=f"message-{index}",
+            sender="jobs@example.com",
+            subject="Job update",
+            timestamp="2026-01-02T00:00:00Z",
+            normalized_body="A hiring update.",
+        )
+        for index in range(500)
+    )
+    classifier = RecordingClassifier(None)
+
+    with SqliteTrackerState(tmp_path / "tracker.sqlite3") as state:
+        state.save_spreadsheet_id("spreadsheet-500")
+        exit_code = run(
+            workspace=ExistingTracker(),
+            state=state,
+            stdout=StringIO(),
+            sync=SyncAdapters(
+                mailbox=FakeMailbox(
+                    MailboxScan(messages=messages, checkpoint="checkpoint-500")
+                ),
+                classifier=classifier,
+                application_sheet=RecordingApplicationSheet(),
+                confirm=lambda: True,
+            ),
+        )
+
+        assert state.get_successful_checkpoint() == "checkpoint-500"
+
+    assert exit_code == 0
+    assert len(classifier.received) == 500
+
+
+def test_large_unprocessed_batch_stops_before_classification_or_state_changes(
+    tmp_path: Path,
+) -> None:
+    messages = tuple(
+        GmailMessage(
+            message_id=f"message-{index}",
+            sender="jobs@example.com",
+            subject="Job update",
+            timestamp="2026-01-02T00:00:00Z",
+            normalized_body="Private email body that must not be printed.",
+        )
+        for index in range(501)
+    )
+    classifier = RecordingClassifier(None)
+    sheet = RecordingApplicationSheet()
+    stdout = StringIO()
+    stderr = StringIO()
+
+    with SqliteTrackerState(tmp_path / "tracker.sqlite3") as state:
+        state.save_spreadsheet_id("spreadsheet-501")
+        exit_code = run(
+            workspace=ExistingTracker(),
+            state=state,
+            stdout=stdout,
+            stderr=stderr,
+            sync=SyncAdapters(
+                mailbox=FakeMailbox(
+                    MailboxScan(messages=messages, checkpoint="checkpoint-501")
+                ),
+                classifier=classifier,
+                application_sheet=sheet,
+                confirm=lambda: True,
+            ),
+        )
+
+        assert state.get_successful_checkpoint() is None
+        assert not state.has_processed_message("message-0")
+
+    assert exit_code == 1
+    assert classifier.received == []
+    assert sheet.rows == []
+    assert stderr.getvalue() == (
+        "Found 501 unprocessed Gmail messages. Re-run with "
+        "--allow-large-import to classify this batch.\n"
+    )
+    assert "Private email body" not in stdout.getvalue()
+    assert "Private email body" not in stderr.getvalue()
+
+
+def test_explicit_override_allows_large_import_to_reach_preview(
+    tmp_path: Path,
+) -> None:
+    messages = tuple(
+        GmailMessage(
+            message_id=f"message-{index}",
+            sender="jobs@example.com",
+            subject="Application received",
+            timestamp="2026-01-02T00:00:00Z",
+            normalized_body="We received your application.",
+        )
+        for index in range(501)
+    )
+    workspace = SyncingWorkspace(
+        MailboxScan(messages=messages, checkpoint="checkpoint-override")
+    )
+    classifier = RecordingClassifier(
+        Application(
+            company="Example Corp",
+            position="Engineer",
+            application_date="2026-01-02",
+        )
+    )
+    stdout = StringIO()
+
+    exit_code = main(
+        ["--data-dir", str(tmp_path), "--allow-large-import"],
+        workspace_factory=lambda config: workspace,
+        classifier_factory=lambda: classifier,
+        stdin=StringIO("no\n"),
+        stdout=stdout,
+    )
+
+    assert exit_code == 0
+    assert len(classifier.received) == 501
+    assert "Proposed Applications:\n" in stdout.getvalue()
+    assert stdout.getvalue().endswith("Cancelled; no Applications imported.\n")
+    assert not workspace.created
+    with SqliteTrackerState(tmp_path / "tracker.sqlite3") as state:
+        assert state.get_successful_checkpoint() is None

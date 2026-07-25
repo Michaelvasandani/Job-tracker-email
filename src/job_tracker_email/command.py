@@ -5,6 +5,7 @@ import os
 import sys
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
+from datetime import date
 from pathlib import Path
 from typing import Protocol, TextIO
 
@@ -107,6 +108,7 @@ class Mailbox(Protocol):
     def find_messages(
         self,
         after_checkpoint: str | None,
+        start_date: date | None = None,
     ) -> MailboxScan: ...
 
 
@@ -186,6 +188,8 @@ def run(
     stdout: TextIO,
     stderr: TextIO | None = None,
     sync: SyncAdapters | None = None,
+    start_date: date | None = None,
+    allow_large_import: bool = False,
 ) -> int:
     error_output = sys.stderr if stderr is None else stderr
     spreadsheet_id = state.get_spreadsheet_id()
@@ -201,7 +205,11 @@ def run(
     if spreadsheet_id is not None:
         stdout.write("Reusing Job Application Tracker.\n")
 
-    scan = sync.mailbox.find_messages(state.get_successful_checkpoint())
+    checkpoint = state.get_successful_checkpoint()
+    scan = sync.mailbox.find_messages(
+        checkpoint,
+        start_date=start_date if checkpoint is None else None,
+    )
     messages = tuple(
         sorted(
             (
@@ -212,6 +220,12 @@ def run(
             key=lambda message: message.timestamp,
         )
     )
+    if len(messages) > 500 and not allow_large_import:
+        error_output.write(
+            f"Found {len(messages)} unprocessed Gmail messages. Re-run with "
+            "--allow-large-import to classify this batch.\n"
+        )
+        return 1
     existing_applications = (
         sync.application_sheet.list_applications(spreadsheet_id)
         if spreadsheet_id is not None
@@ -609,6 +623,8 @@ def main(
                     application_sheet=workspace,
                     confirm=confirm,
                 ),
+                start_date=arguments.start_date,
+                allow_large_import=arguments.allow_large_import,
             )
     except Exception:
         error_output.write(
@@ -644,6 +660,19 @@ def _parser() -> argparse.ArgumentParser:
             "~/.local/share/job-tracker-email)"
         ),
     )
+    parser.add_argument(
+        "--start-date",
+        type=_parse_start_date,
+        help=(
+            "earliest date to include in the initial Gmail history scan "
+            "(YYYY-MM-DD)"
+        ),
+    )
+    parser.add_argument(
+        "--allow-large-import",
+        action="store_true",
+        help="classify a batch larger than 500 messages",
+    )
     return parser
 
 
@@ -652,3 +681,12 @@ def _default_data_dir() -> Path:
     if configured_path:
         return Path(configured_path)
     return Path.home() / ".local" / "share" / "job-tracker-email"
+
+
+def _parse_start_date(value: str) -> date:
+    try:
+        return date.fromisoformat(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            "must be a calendar date in YYYY-MM-DD format"
+        ) from error

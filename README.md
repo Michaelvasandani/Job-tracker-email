@@ -43,6 +43,22 @@ creates `Job Application Tracker`. The command reads eligible Gmail messages
 in chronological order and sends only sender, subject, timestamp, and
 normalized plain-text body to OpenAI. It never opens or transmits attachments.
 
+The initial scan includes all eligible Gmail history by default, including
+archived and sent messages, while always excluding spam and trash. To limit
+that first scan, provide the earliest date to include:
+
+```bash
+job-tracker-email --start-date 2026-01-01
+```
+
+To prevent unexpected OpenAI usage, the command stops before classification
+when it finds more than 500 unprocessed messages. After reviewing the reported
+count, deliberately continue a known large import with:
+
+```bash
+job-tracker-email --allow-large-import
+```
+
 For each clearly confirmed Application, the command previews Company,
 Position, Application Date, Status, and Stage. Enter `y` or `yes` to append the
 row. Any other response cancels the batch without advancing the checkpoint.

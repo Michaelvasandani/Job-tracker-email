@@ -4,7 +4,7 @@ import base64
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any, cast
@@ -74,6 +74,7 @@ class GoogleApiWorkspace:
     def find_messages(
         self,
         after_checkpoint: str | None,
+        start_date: date | None = None,
     ) -> MailboxScan:
         service = self._build_google_service("gmail", "v1")
         query = "in:anywhere -in:spam -in:trash"
@@ -83,6 +84,8 @@ class GoogleApiWorkspace:
                 int(after_checkpoint) // 1000 - 1,
             )
             query = f"{query} after:{checkpoint_seconds}"
+        elif start_date is not None:
+            query = f"{query} after:{start_date:%Y/%m/%d}"
 
         message_ids: list[str] = []
         page_token: str | None = None

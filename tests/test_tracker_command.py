@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import date
 from io import StringIO
 from pathlib import Path
 from typing import Any
@@ -44,6 +45,7 @@ class FakeGoogleWorkspace:
     def find_messages(
         self,
         after_checkpoint: str | None,
+        start_date: date | None = None,
     ) -> MailboxScan:
         return MailboxScan(messages=(), checkpoint=after_checkpoint or "0")
 
@@ -306,6 +308,7 @@ def test_command_does_not_print_secrets_from_google_errors(
         def find_messages(
             self,
             after_checkpoint: str | None,
+            start_date: date | None = None,
         ) -> MailboxScan:
             raise AssertionError("Spreadsheet creation must fail first.")
 
