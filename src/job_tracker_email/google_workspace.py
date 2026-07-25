@@ -375,18 +375,105 @@ class GoogleApiWorkspace:
         }
         sheets: list[dict[str, Any]] = [
             {
-                "properties": {"title": "Applications"},
+                "properties": {"sheetId": 0, "title": "Applications"},
                 "data": [{"rowData": [application_header]}],
+                "conditionalFormats": _application_status_formats(),
             }
         ]
         sheets.extend(
-            {"properties": {"title": tab}}
+            _sheet_for_tab(tab)
             for tab in definition.additional_tabs
         )
         return {
             "properties": {"title": definition.title},
             "sheets": sheets,
         }
+
+
+def _sheet_for_tab(tab: str) -> dict[str, Any]:
+    if tab != "Stats":
+        return {"properties": {"title": tab}}
+    return {
+        "properties": {"title": tab},
+        "data": [
+            {
+                "rowData": [
+                    _stats_row("Metric", "Count"),
+                    _stats_row(
+                        "Total Applications",
+                        "=COUNTA(Applications!A2:A)",
+                    ),
+                    _stats_row(
+                        "Active",
+                        '=COUNTIF(Applications!D2:D,"Active")',
+                    ),
+                    _stats_row(
+                        "Rejected",
+                        '=COUNTIF(Applications!D2:D,"Rejected")',
+                    ),
+                    _stats_row(
+                        "Offers",
+                        '=COUNTIF(Applications!D2:D,"Offer")',
+                    ),
+                    _stats_row(
+                        "Withdrawn",
+                        '=COUNTIF(Applications!D2:D,"Withdrawn")',
+                    ),
+                ]
+            }
+        ],
+    }
+
+
+def _stats_row(label: str, value: str) -> dict[str, Any]:
+    value_type = "formulaValue" if value.startswith("=") else "stringValue"
+    return {
+        "values": [
+            {"userEnteredValue": {"stringValue": label}},
+            {"userEnteredValue": {value_type: value}},
+        ]
+    }
+
+
+def _application_status_formats() -> list[dict[str, Any]]:
+    return [
+        _status_format("Active", red=0.85, green=1.0, blue=0.85),
+        _status_format("Offer", red=0.85, green=0.92, blue=1.0),
+        _status_format("Rejected", red=1.0, green=0.85, blue=0.85),
+        _status_format("Withdrawn", red=0.9, green=0.9, blue=0.9),
+    ]
+
+
+def _status_format(
+    status: str,
+    *,
+    red: float,
+    green: float,
+    blue: float,
+) -> dict[str, Any]:
+    return {
+        "ranges": [
+            {
+                "sheetId": 0,
+                "startRowIndex": 1,
+                "startColumnIndex": 0,
+                "endColumnIndex": 5,
+            }
+        ],
+        "booleanRule": {
+            "condition": {
+                "type": "CUSTOM_FORMULA",
+                "values": [{"userEnteredValue": f'=$D2="{status}"'}],
+            },
+            "format": {
+                "backgroundColor": {
+                    "red": red,
+                    "green": green,
+                    "blue": blue,
+                }
+            },
+        },
+    }
 
 
 class _PlainTextHtmlParser(HTMLParser):

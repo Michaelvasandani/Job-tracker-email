@@ -3,11 +3,13 @@ from __future__ import annotations
 from dataclasses import dataclass
 from io import StringIO
 from pathlib import Path
+from typing import Any
 
 from job_tracker_email.command import main, run
 from job_tracker_email.google_workspace import (
     DRIVE_FILE_SCOPE,
     GMAIL_READONLY_SCOPE,
+    GoogleApiWorkspace,
     GoogleAuthConfig,
     TrackerSpreadsheet,
 )
@@ -55,6 +57,26 @@ class FakeGoogleWorkspace:
         return 0
 
 
+class FakeGoogleRequest:
+    def __init__(self, response: dict[str, Any]) -> None:
+        self._response = response
+
+    def execute(self) -> dict[str, Any]:
+        return self._response
+
+
+class RecordingSheetsService:
+    def __init__(self) -> None:
+        self.create_requests: list[dict[str, Any]] = []
+
+    def spreadsheets(self) -> RecordingSheetsService:
+        return self
+
+    def create(self, **arguments: Any) -> FakeGoogleRequest:
+        self.create_requests.append(arguments)
+        return FakeGoogleRequest({"spreadsheetId": "spreadsheet-stats"})
+
+
 def test_manual_command_creates_then_reuses_one_local_tracker(
     tmp_path: Path,
 ) -> None:
@@ -98,6 +120,100 @@ def test_manual_command_creates_then_reuses_one_local_tracker(
             ),
         )
     ]
+
+
+def test_sheets_adapter_creates_formula_driven_stats_and_status_colors(
+    tmp_path: Path,
+) -> None:
+    service = RecordingSheetsService()
+    workspace = GoogleApiWorkspace(
+        GoogleAuthConfig(
+            client_secrets_path=tmp_path / "credentials.json",
+            token_path=tmp_path / "token.json",
+        ),
+        service_factory=lambda api_name, api_version: service,
+    )
+
+    spreadsheet_id = workspace.create_spreadsheet(
+        TrackerSpreadsheet(
+            title="Job Application Tracker",
+            applications_columns=(
+                "Company",
+                "Position",
+                "Application Date",
+                "Status",
+                "Stage",
+            ),
+            additional_tabs=("Needs Review", "Stats"),
+        )
+    )
+
+    assert spreadsheet_id == "spreadsheet-stats"
+    sheet_definitions = service.create_requests[0]["body"]["sheets"]
+    stats_sheet = next(
+        sheet
+        for sheet in sheet_definitions
+        if sheet["properties"]["title"] == "Stats"
+    )
+    stats_rows = stats_sheet["data"][0]["rowData"]
+    assert [
+        [cell["userEnteredValue"] for cell in row["values"]]
+        for row in stats_rows
+    ] == [
+        [{"stringValue": "Metric"}, {"stringValue": "Count"}],
+        [
+            {"stringValue": "Total Applications"},
+            {"formulaValue": "=COUNTA(Applications!A2:A)"},
+        ],
+        [
+            {"stringValue": "Active"},
+            {"formulaValue": '=COUNTIF(Applications!D2:D,"Active")'},
+        ],
+        [
+            {"stringValue": "Rejected"},
+            {"formulaValue": '=COUNTIF(Applications!D2:D,"Rejected")'},
+        ],
+        [
+            {"stringValue": "Offers"},
+            {"formulaValue": '=COUNTIF(Applications!D2:D,"Offer")'},
+        ],
+        [
+            {"stringValue": "Withdrawn"},
+            {"formulaValue": '=COUNTIF(Applications!D2:D,"Withdrawn")'},
+        ],
+    ]
+    applications_sheet = sheet_definitions[0]
+    status_formats = applications_sheet["conditionalFormats"]
+    assert [
+        rule["booleanRule"]["condition"]["values"][0][
+            "userEnteredValue"
+        ]
+        for rule in status_formats
+    ] == [
+        '=$D2="Active"',
+        '=$D2="Offer"',
+        '=$D2="Rejected"',
+        '=$D2="Withdrawn"',
+    ]
+    assert [
+        rule["booleanRule"]["format"]["backgroundColor"]
+        for rule in status_formats
+    ] == [
+        {"red": 0.85, "green": 1.0, "blue": 0.85},
+        {"red": 0.85, "green": 0.92, "blue": 1.0},
+        {"red": 1.0, "green": 0.85, "blue": 0.85},
+        {"red": 0.9, "green": 0.9, "blue": 0.9},
+    ]
+    assert [rule["ranges"] for rule in status_formats] == [
+        [
+            {
+                "sheetId": 0,
+                "startRowIndex": 1,
+                "startColumnIndex": 0,
+                "endColumnIndex": 5,
+            }
+        ]
+    ] * 4
 
 
 def test_installed_command_requests_only_required_google_permissions(
