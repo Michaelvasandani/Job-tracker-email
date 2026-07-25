@@ -147,6 +147,54 @@ class GoogleApiWorkspace:
             self._application_row(application),
         )
 
+    def list_applications(
+        self,
+        spreadsheet_id: str,
+    ) -> tuple[Application, ...]:
+        service = self._build_google_service("sheets", "v4")
+        response = (
+            service.spreadsheets()
+            .values()
+            .get(spreadsheetId=spreadsheet_id, range="Applications!A2:E")
+            .execute()
+        )
+        applications: list[Application] = []
+        for row in response.get("values", []):
+            if not isinstance(row, list) or len(row) < 4:
+                continue
+            values = [str(value) for value in row] + [""] * (5 - len(row))
+            if values[3] not in {"Active", "Rejected", "Offer", "Withdrawn"}:
+                continue
+            applications.append(
+                Application(
+                    company=values[0],
+                    position=values[1],
+                    application_date=values[2],
+                    status=values[3],  # type: ignore[arg-type]
+                    stage=values[4],
+                )
+            )
+        return tuple(applications)
+
+    def update_application_status(
+        self,
+        spreadsheet_id: str,
+        row_number: int,
+        status: str,
+    ) -> None:
+        service = self._build_google_service("sheets", "v4")
+        (
+            service.spreadsheets()
+            .values()
+            .update(
+                spreadsheetId=spreadsheet_id,
+                range=f"Applications!D{row_number}",
+                valueInputOption="RAW",
+                body={"values": [[status]]},
+            )
+            .execute()
+        )
+
     def append_needs_review(
         self,
         spreadsheet_id: str,

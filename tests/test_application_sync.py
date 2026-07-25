@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import base64
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
@@ -20,11 +20,13 @@ from job_tracker_email.openai_classifier import (
 )
 from job_tracker_email.sync import (
     Application,
+    ApplicationStatus,
     ClassificationInput,
     GmailMessage,
     MailboxScan,
     NeedsReview,
     ReviewProposal,
+    StatusUpdate,
 )
 from job_tracker_email.state import SqliteTrackerState
 
@@ -40,7 +42,7 @@ class FakeMailbox:
 class RecordingClassifier:
     def __init__(
         self,
-        result: Application | ReviewProposal | None,
+        result: Application | ReviewProposal | StatusUpdate | None,
     ) -> None:
         self.result = result
         self.received: list[ClassificationInput] = []
@@ -48,9 +50,25 @@ class RecordingClassifier:
     def classify(
         self,
         message: ClassificationInput,
-    ) -> Application | ReviewProposal | None:
+    ) -> Application | ReviewProposal | StatusUpdate | None:
         self.received.append(message)
         return self.result
+
+
+class ScenarioClassifier:
+    def __init__(
+        self,
+        outcomes: dict[str, Application | ReviewProposal | StatusUpdate | None],
+    ) -> None:
+        self._outcomes = outcomes
+        self.received: list[ClassificationInput] = []
+
+    def classify(
+        self,
+        message: ClassificationInput,
+    ) -> Application | ReviewProposal | StatusUpdate | None:
+        self.received.append(message)
+        return self._outcomes[message.subject]
 
 
 class RecordingApplicationSheet:
@@ -86,6 +104,27 @@ class RecordingApplicationSheet:
     ) -> int:
         return self.review_rows.count((spreadsheet_id, review))
 
+    def list_applications(
+        self,
+        spreadsheet_id: str,
+    ) -> tuple[Application, ...]:
+        return tuple(
+            application
+            for row_spreadsheet_id, application in self.rows
+            if row_spreadsheet_id == spreadsheet_id
+        )
+
+    def update_application_status(
+        self,
+        spreadsheet_id: str,
+        row_number: int,
+        status: ApplicationStatus,
+    ) -> None:
+        row_index = row_number - 2
+        row_spreadsheet_id, application = self.rows[row_index]
+        assert row_spreadsheet_id == spreadsheet_id
+        self.rows[row_index] = (row_spreadsheet_id, replace(application, status=status))
+
 
 class FailOnceApplicationSheet(RecordingApplicationSheet):
     def __init__(self) -> None:
@@ -103,6 +142,23 @@ class FailOnceApplicationSheet(RecordingApplicationSheet):
             raise RuntimeError(
                 "write failed while handling private-email-body"
             )
+
+
+class FailOnceStatusSheet(RecordingApplicationSheet):
+    def __init__(self) -> None:
+        super().__init__()
+        self.status_attempts = 0
+
+    def update_application_status(
+        self,
+        spreadsheet_id: str,
+        row_number: int,
+        status: ApplicationStatus,
+    ) -> None:
+        self.status_attempts += 1
+        super().update_application_status(spreadsheet_id, row_number, status)
+        if self.status_attempts == 1:
+            raise RuntimeError("status write failed")
 
 
 class ExistingTracker:
@@ -764,6 +820,283 @@ def test_distinct_submissions_with_same_fields_create_separate_applications(
     ]
 
 
+def test_incremental_updates_are_chronological_and_preserve_manual_fields(
+    tmp_path: Path,
+) -> None:
+    sheet = RecordingApplicationSheet()
+    sheet.rows = [
+        (
+            "spreadsheet-status",
+            Application(
+                company="Acme",
+                position="Senior Engineer",
+                application_date="2026-07-01",
+                stage="Manually entered interview stage",
+            ),
+        )
+    ]
+    mailbox = FakeMailbox(
+        MailboxScan(
+            messages=(
+                GmailMessage(
+                    message_id="later-rejection",
+                    sender="Acme <jobs@acme.example>",
+                    subject="Rejection",
+                    timestamp="2026-07-24T10:00:00Z",
+                    normalized_body="The position was filled.",
+                ),
+                GmailMessage(
+                    message_id="earlier-offer",
+                    sender="Acme <jobs@acme.example>",
+                    subject="Offer",
+                    timestamp="2026-07-24T09:00:00Z",
+                    normalized_body="We are pleased to offer you the role.",
+                ),
+            ),
+            checkpoint="checkpoint-status",
+        )
+    )
+    classifier = ScenarioClassifier(
+        {
+            "Offer": StatusUpdate(
+                company="Acme",
+                position="Senior Engineer",
+                status="Offer",
+            ),
+            "Rejection": StatusUpdate(
+                company="Acme",
+                position="Senior Engineer",
+                status="Rejected",
+            ),
+        }
+    )
+
+    with SqliteTrackerState(tmp_path / "tracker.sqlite3") as state:
+        state.save_spreadsheet_id("spreadsheet-status")
+        state.record_successful_sync("previous-checkpoint", ())
+        exit_code = run(
+            workspace=ExistingTracker(),
+            state=state,
+            stdout=StringIO(),
+            sync=SyncAdapters(
+                mailbox=mailbox,
+                classifier=classifier,
+                application_sheet=sheet,
+                confirm=lambda: True,
+            ),
+        )
+
+        assert state.get_successful_checkpoint() == "checkpoint-status"
+        assert state.has_processed_message("earlier-offer")
+        assert state.has_processed_message("later-rejection")
+
+    assert exit_code == 0
+    assert [item.subject for item in classifier.received] == [
+        "Offer",
+        "Rejection",
+    ]
+    assert sheet.rows == [
+        (
+            "spreadsheet-status",
+            Application(
+                company="Acme",
+                position="Senior Engineer",
+                application_date="2026-07-01",
+                status="Offer",
+                stage="Manually entered interview stage",
+            ),
+        )
+    ]
+    assert sheet.review_rows == [
+        (
+            "spreadsheet-status",
+            NeedsReview(
+                email_date="2026-07-24",
+                sender="Acme <jobs@acme.example>",
+                subject="Rejection",
+                gmail_link=(
+                    "https://mail.google.com/mail/u/0/#all/later-rejection"
+                ),
+                reason="Cannot replace terminal Offer Status with Rejected.",
+            ),
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    ("update_status", "expected_status"),
+    [
+        pytest.param("Active", "Active", id="advancement-stays-active"),
+        pytest.param("Rejected", "Rejected", id="explicit-rejection"),
+        pytest.param("Offer", "Offer", id="explicit-offer"),
+        pytest.param("Withdrawn", "Withdrawn", id="pre-offer-withdrawal"),
+    ],
+)
+def test_unique_active_application_accepts_allowed_status_update(
+    tmp_path: Path,
+    update_status: str,
+    expected_status: str,
+) -> None:
+    sheet = RecordingApplicationSheet()
+    sheet.rows = [
+        (
+            "spreadsheet-transition",
+            Application(
+                company="Example Corp",
+                position="Designer",
+                application_date="2026-07-01",
+            ),
+        )
+    ]
+    message = GmailMessage(
+        message_id=f"status-{update_status}",
+        sender="Example Corp <jobs@example.com>",
+        subject="Status update",
+        timestamp="2026-07-24T12:00:00Z",
+        normalized_body="A status update.",
+    )
+
+    with SqliteTrackerState(tmp_path / "tracker.sqlite3") as state:
+        state.save_spreadsheet_id("spreadsheet-transition")
+        exit_code = run(
+            workspace=ExistingTracker(),
+            state=state,
+            stdout=StringIO(),
+            sync=SyncAdapters(
+                mailbox=FakeMailbox(
+                    MailboxScan(
+                        messages=(message,),
+                        checkpoint="checkpoint-transition",
+                    )
+                ),
+                classifier=RecordingClassifier(
+                    StatusUpdate(
+                        company="Example Corp",
+                        position="Designer",
+                        status=cast(ApplicationStatus, update_status),
+                    )
+                ),
+                application_sheet=sheet,
+                confirm=lambda: True,
+            ),
+        )
+
+    assert exit_code == 0
+    assert sheet.rows[0][1].status == expected_status
+    assert sheet.review_rows == []
+
+
+def test_ambiguous_status_update_is_reviewed_without_changing_any_row(
+    tmp_path: Path,
+) -> None:
+    application = Application(
+        company="Example Corp",
+        position="Engineer",
+        application_date="2026-07-01",
+    )
+    sheet = RecordingApplicationSheet()
+    sheet.rows = [
+        ("spreadsheet-ambiguous", application),
+        ("spreadsheet-ambiguous", application),
+    ]
+
+    with SqliteTrackerState(tmp_path / "tracker.sqlite3") as state:
+        state.save_spreadsheet_id("spreadsheet-ambiguous")
+        exit_code = run(
+            workspace=ExistingTracker(),
+            state=state,
+            stdout=StringIO(),
+            sync=SyncAdapters(
+                mailbox=FakeMailbox(
+                    MailboxScan(
+                        messages=(
+                            GmailMessage(
+                                message_id="ambiguous-update",
+                                sender="Example Corp <jobs@example.com>",
+                                subject="Update",
+                                timestamp="2026-07-24T12:00:00Z",
+                                normalized_body="The role has been filled.",
+                            ),
+                        ),
+                        checkpoint="checkpoint-ambiguous",
+                    )
+                ),
+                classifier=RecordingClassifier(
+                    StatusUpdate(
+                        company="Example Corp",
+                        position="Engineer",
+                        status="Rejected",
+                    )
+                ),
+                application_sheet=sheet,
+                confirm=lambda: True,
+            ),
+        )
+
+    assert exit_code == 0
+    assert sheet.rows == [
+        ("spreadsheet-ambiguous", application),
+        ("spreadsheet-ambiguous", application),
+    ]
+    assert sheet.review_rows[0][1].reason == (
+        "Multiple Applications match this Status update."
+    )
+
+
+def test_failed_status_update_retries_without_reclassifying_or_rewriting(
+    tmp_path: Path,
+) -> None:
+    sheet = FailOnceStatusSheet()
+    sheet.rows = [
+        (
+            "spreadsheet-retry-status",
+            Application(
+                company="Example Corp",
+                position="Engineer",
+                application_date="2026-07-01",
+            ),
+        )
+    ]
+    message = GmailMessage(
+        message_id="retry-status",
+        sender="Example Corp <jobs@example.com>",
+        subject="Offer",
+        timestamp="2026-07-24T12:00:00Z",
+        normalized_body="An offer.",
+    )
+    classifier = RecordingClassifier(
+        StatusUpdate(
+            company="Example Corp",
+            position="Engineer",
+            status="Offer",
+        )
+    )
+    state_path = tmp_path / "tracker.sqlite3"
+
+    with SqliteTrackerState(state_path) as state:
+        state.save_spreadsheet_id("spreadsheet-retry-status")
+        sync = SyncAdapters(
+            mailbox=FakeMailbox(
+                MailboxScan(messages=(message,), checkpoint="checkpoint-retry")
+            ),
+            classifier=classifier,
+            application_sheet=sheet,
+            confirm=lambda: True,
+        )
+        assert run(
+            workspace=ExistingTracker(), state=state, stdout=StringIO(), sync=sync
+        ) == 1
+        assert state.get_successful_checkpoint() is None
+        assert run(
+            workspace=ExistingTracker(), state=state, stdout=StringIO(), sync=sync
+        ) == 0
+        assert state.get_successful_checkpoint() == "checkpoint-retry"
+
+    assert sheet.rows[0][1].status == "Offer"
+    assert sheet.status_attempts == 1
+    assert len(classifier.received) == 1
+
+
 def test_real_gmail_adapter_excludes_attachment_text_from_classifier(
     tmp_path: Path,
 ) -> None:
@@ -907,3 +1240,34 @@ def test_real_openai_adapter_transmits_only_minimized_email_fields(
     }
     assert request["store"] is False
     assert "gmail-id-must-stay-local" not in repr(request)
+
+
+def test_real_openai_adapter_returns_a_conclusive_status_update() -> None:
+    client = FakeOpenAIClient()
+    client.responses.create = lambda **request: SimpleNamespace(  # type: ignore[method-assign]
+        output_text=json.dumps(
+            {
+                "kind": "status_update",
+                "company": "Example Corp",
+                "position": "Software Engineer",
+                "application_date": "",
+                "status": "Rejected",
+                "reason": "",
+            }
+        )
+    )
+
+    outcome = OpenAIApplicationClassifier(client=client).classify(
+        ClassificationInput(
+            sender="Example Corp <jobs@example.com>",
+            subject="Update on your application",
+            timestamp="2026-07-24T15:00:00Z",
+            normalized_body="We selected another candidate.",
+        )
+    )
+
+    assert outcome == StatusUpdate(
+        company="Example Corp",
+        position="Software Engineer",
+        status="Rejected",
+    )

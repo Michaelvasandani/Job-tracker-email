@@ -4,7 +4,7 @@ import argparse
 import os
 import sys
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Protocol, TextIO
 
@@ -19,11 +19,15 @@ from job_tracker_email.openai_classifier import (
 from job_tracker_email.state import SqliteTrackerState
 from job_tracker_email.sync import (
     Application,
+    ApplicationStatus,
     ClassificationInput,
+    GmailMessage,
     MailboxScan,
     PendingApplicationWrite,
+    PendingStatusUpdate,
     NeedsReview,
     ReviewProposal,
+    StatusUpdate,
 )
 
 
@@ -60,11 +64,23 @@ class TrackerState(Protocol):
         message_id: str,
     ) -> PendingApplicationWrite | None: ...
 
+    def get_pending_status_update(
+        self,
+        message_id: str,
+    ) -> PendingStatusUpdate | None: ...
+
     def record_pending_application_write(
         self,
         message_id: str,
         application: Application,
         matching_rows_before_write: int,
+    ) -> None: ...
+
+    def record_pending_status_update(
+        self,
+        message_id: str,
+        row_number: int,
+        status: ApplicationStatus,
     ) -> None: ...
 
     def record_successful_sync(
@@ -85,7 +101,7 @@ class ApplicationClassifier(Protocol):
     def classify(
         self,
         message: ClassificationInput,
-    ) -> Application | ReviewProposal | None: ...
+    ) -> Application | ReviewProposal | StatusUpdate | None: ...
 
 
 class ApplicationSheet(Protocol):
@@ -99,6 +115,18 @@ class ApplicationSheet(Protocol):
         self,
         spreadsheet_id: str,
         application: Application,
+    ) -> None: ...
+
+    def list_applications(
+        self,
+        spreadsheet_id: str,
+    ) -> tuple[Application, ...]: ...
+
+    def update_application_status(
+        self,
+        spreadsheet_id: str,
+        row_number: int,
+        status: ApplicationStatus,
     ) -> None: ...
 
     def count_matching_needs_review(
@@ -131,6 +159,13 @@ class SyncAdapters:
     confirm: Callable[[], bool]
 
 
+@dataclass(frozen=True)
+class StatusUpdateProposal:
+    message_id: str
+    row_number: int
+    status: ApplicationStatus
+
+
 def run(
     *,
     workspace: GoogleWorkspace,
@@ -155,16 +190,47 @@ def run(
 
     scan = sync.mailbox.find_messages(state.get_successful_checkpoint())
     messages = tuple(
-        message
-        for message in scan.messages
-        if not state.has_processed_message(message.message_id)
+        sorted(
+            (
+                message
+                for message in scan.messages
+                if not state.has_processed_message(message.message_id)
+            ),
+            key=lambda message: message.timestamp,
+        )
     )
+    existing_applications = (
+        sync.application_sheet.list_applications(spreadsheet_id)
+        if spreadsheet_id is not None
+        else ()
+    )
+    applications_by_row = {
+        row_number: application
+        for row_number, application in enumerate(existing_applications, start=2)
+    }
+    planned_statuses: dict[int, ApplicationStatus] = {}
     application_proposals: list[tuple[str, Application]] = []
+    status_update_proposals: list[StatusUpdateProposal] = []
     review_proposals: list[tuple[str, NeedsReview]] = []
     for message in messages:
         pending_write = state.get_pending_application_write(
             message.message_id
         )
+        pending_status_update = state.get_pending_status_update(
+            message.message_id
+        )
+        if pending_status_update is not None:
+            status_update_proposals.append(
+                StatusUpdateProposal(
+                    message_id=message.message_id,
+                    row_number=pending_status_update.row_number,
+                    status=pending_status_update.status,
+                )
+            )
+            planned_statuses[pending_status_update.row_number] = (
+                pending_status_update.status
+            )
+            continue
         if pending_write is None:
             outcome = sync.classifier.classify(
                 ClassificationInput(
@@ -178,24 +244,108 @@ def run(
             outcome = pending_write.application
         if isinstance(outcome, Application):
             application_proposals.append((message.message_id, outcome))
+        elif isinstance(outcome, StatusUpdate):
+            matching_rows = [
+                row_number
+                for row_number, application in applications_by_row.items()
+                if application.company == outcome.company
+                and application.position == outcome.position
+            ]
+            matching_proposals = [
+                proposal_index
+                for proposal_index, (_, application) in enumerate(
+                    application_proposals
+                )
+                if application.company == outcome.company
+                and application.position == outcome.position
+            ]
+            total_matches = len(matching_rows) + len(matching_proposals)
+            if total_matches == 0:
+                review_proposals.append(
+                    (
+                        message.message_id,
+                        _needs_review(
+                            message,
+                            "No Application matches this Status update.",
+                        ),
+                    )
+                )
+            elif total_matches > 1:
+                review_proposals.append(
+                    (
+                        message.message_id,
+                        _needs_review(
+                            message,
+                            "Multiple Applications match this Status update.",
+                        ),
+                    )
+                )
+            elif matching_proposals:
+                proposal_index = matching_proposals[0]
+                proposal_message_id, application = application_proposals[
+                    proposal_index
+                ]
+                if application.status == "Active":
+                    application_proposals[proposal_index] = (
+                        proposal_message_id,
+                        replace(application, status=outcome.status),
+                    )
+                elif application.status != outcome.status:
+                    review_proposals.append(
+                        (
+                            message.message_id,
+                            _needs_review(
+                                message,
+                                _terminal_status_reason(
+                                    application.status,
+                                    outcome.status,
+                                ),
+                            ),
+                        )
+                    )
+            else:
+                row_number = matching_rows[0]
+                current_status = planned_statuses.get(
+                    row_number,
+                    applications_by_row[row_number].status,
+                )
+                if current_status == outcome.status:
+                    continue
+                if current_status != "Active":
+                    review_proposals.append(
+                        (
+                            message.message_id,
+                            _needs_review(
+                                message,
+                                _terminal_status_reason(
+                                    current_status,
+                                    outcome.status,
+                                ),
+                            ),
+                        )
+                    )
+                elif outcome.status != "Active":
+                    status_update_proposals.append(
+                        StatusUpdateProposal(
+                            message_id=message.message_id,
+                            row_number=row_number,
+                            status=outcome.status,
+                        )
+                    )
+                    planned_statuses[row_number] = outcome.status
         elif isinstance(outcome, ReviewProposal):
             review_proposals.append(
                 (
                     message.message_id,
-                    NeedsReview(
-                        email_date=message.timestamp[:10],
-                        sender=message.sender,
-                        subject=message.subject,
-                        gmail_link=(
-                            "https://mail.google.com/mail/u/0/#all/"
-                            f"{message.message_id}"
-                        ),
-                        reason=outcome.reason,
-                    ),
+                    _needs_review(message, outcome.reason),
                 )
             )
 
-    if not application_proposals and not review_proposals:
+    if (
+        not application_proposals
+        and not status_update_proposals
+        and not review_proposals
+    ):
         if spreadsheet_id is None:
             spreadsheet_id = workspace.create_spreadsheet(
                 TRACKER_SPREADSHEET
@@ -217,6 +367,15 @@ def run(
                 f"  Application Date: {application.application_date}\n"
                 f"  Status: {application.status}\n"
                 f"  Stage: {application.stage or '(blank)'}\n"
+            )
+    if status_update_proposals:
+        stdout.write("Proposed Status updates:\n")
+        for proposal in status_update_proposals:
+            application = applications_by_row[proposal.row_number]
+            stdout.write(
+                f"  Company: {application.company}\n"
+                f"  Position: {application.position}\n"
+                f"  Status: {proposal.status}\n"
             )
     if review_proposals:
         stdout.write("Proposed Needs Review items:\n")
@@ -246,7 +405,7 @@ def run(
                 message_id
             )
             if pending_write is None:
-                matching_rows = (
+                matching_rows_before_write = (
                     sync.application_sheet.count_matching_applications(
                         spreadsheet_id,
                         application,
@@ -255,7 +414,7 @@ def run(
                 state.record_pending_application_write(
                     message_id,
                     application,
-                    matching_rows,
+                    matching_rows_before_write,
                 )
                 should_append = True
             else:
@@ -273,6 +432,25 @@ def run(
                 sync.application_sheet.append_application(
                     spreadsheet_id,
                     application,
+                )
+        for proposal in status_update_proposals:
+            pending_status_update = state.get_pending_status_update(
+                proposal.message_id
+            )
+            if pending_status_update is None:
+                state.record_pending_status_update(
+                    proposal.message_id,
+                    proposal.row_number,
+                    proposal.status,
+                )
+            current_application = sync.application_sheet.list_applications(
+                spreadsheet_id
+            )[proposal.row_number - 2]
+            if current_application.status != proposal.status:
+                sync.application_sheet.update_application_status(
+                    spreadsheet_id,
+                    proposal.row_number,
+                    proposal.status,
                 )
         for _, review in review_proposals:
             if (
@@ -297,6 +475,28 @@ def run(
     )
     stdout.write("Application imported.\n")
     return 0
+
+
+def _needs_review(message: GmailMessage, reason: str) -> NeedsReview:
+    return NeedsReview(
+        email_date=message.timestamp[:10],
+        sender=message.sender,
+        subject=message.subject,
+        gmail_link=(
+            "https://mail.google.com/mail/u/0/#all/" f"{message.message_id}"
+        ),
+        reason=reason,
+    )
+
+
+def _terminal_status_reason(
+    current_status: ApplicationStatus,
+    proposed_status: ApplicationStatus,
+) -> str:
+    return (
+        f"Cannot replace terminal {current_status} Status with "
+        f"{proposed_status}."
+    )
 
 
 WorkspaceFactory = Callable[[GoogleAuthConfig], GoogleSyncWorkspace]

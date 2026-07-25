@@ -14,7 +14,12 @@ from job_tracker_email.google_workspace import (
     TrackerSpreadsheet,
 )
 from job_tracker_email.state import SqliteTrackerState
-from job_tracker_email.sync import Application, MailboxScan, NeedsReview
+from job_tracker_email.sync import (
+    Application,
+    ApplicationStatus,
+    MailboxScan,
+    NeedsReview,
+)
 
 
 @dataclass
@@ -55,6 +60,20 @@ class FakeGoogleWorkspace:
         application: Application,
     ) -> int:
         return 0
+
+    def list_applications(
+        self,
+        spreadsheet_id: str,
+    ) -> tuple[Application, ...]:
+        return ()
+
+    def update_application_status(
+        self,
+        spreadsheet_id: str,
+        row_number: int,
+        status: ApplicationStatus,
+    ) -> None:
+        raise AssertionError("An empty mailbox cannot update an Application.")
 
     def count_matching_needs_review(
         self,
@@ -301,6 +320,20 @@ def test_command_does_not_print_secrets_from_google_errors(
             self,
             spreadsheet_id: str,
             application: Application,
+        ) -> None:
+            raise AssertionError("Spreadsheet creation must fail first.")
+
+        def list_applications(
+            self,
+            spreadsheet_id: str,
+        ) -> tuple[Application, ...]:
+            raise AssertionError("Spreadsheet creation must fail first.")
+
+        def update_application_status(
+            self,
+            spreadsheet_id: str,
+            row_number: int,
+            status: ApplicationStatus,
         ) -> None:
             raise AssertionError("Spreadsheet creation must fail first.")
 

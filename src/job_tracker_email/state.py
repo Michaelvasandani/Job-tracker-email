@@ -4,7 +4,12 @@ import sqlite3
 from pathlib import Path
 from types import TracebackType
 
-from job_tracker_email.sync import Application, PendingApplicationWrite
+from job_tracker_email.sync import (
+    Application,
+    ApplicationStatus,
+    PendingApplicationWrite,
+    PendingStatusUpdate,
+)
 
 
 class SqliteTrackerState:
@@ -36,6 +41,15 @@ class SqliteTrackerState:
                 status TEXT NOT NULL,
                 stage TEXT NOT NULL,
                 matching_rows_before_write INTEGER NOT NULL
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS pending_status_updates (
+                gmail_message_id TEXT PRIMARY KEY,
+                row_number INTEGER NOT NULL,
+                status TEXT NOT NULL
             )
             """
         )
@@ -117,6 +131,28 @@ class SqliteTrackerState:
             matching_rows_before_write=int(row[5]),
         )
 
+    def get_pending_status_update(
+        self,
+        message_id: str,
+    ) -> PendingStatusUpdate | None:
+        row = self._connection.execute(
+            """
+            SELECT row_number, status
+            FROM pending_status_updates
+            WHERE gmail_message_id = ?
+            """,
+            (message_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        status = str(row[1])
+        if status not in {"Rejected", "Offer", "Withdrawn"}:
+            raise RuntimeError("Pending Status update has an invalid Status.")
+        return PendingStatusUpdate(
+            row_number=int(row[0]),
+            status=status,  # type: ignore[arg-type]
+        )
+
     def record_pending_application_write(
         self,
         message_id: str,
@@ -156,6 +192,26 @@ class SqliteTrackerState:
         )
         self._connection.commit()
 
+    def record_pending_status_update(
+        self,
+        message_id: str,
+        row_number: int,
+        status: ApplicationStatus,
+    ) -> None:
+        self._connection.execute(
+            """
+            INSERT INTO pending_status_updates (
+                gmail_message_id, row_number, status
+            )
+            VALUES (?, ?, ?)
+            ON CONFLICT(gmail_message_id) DO UPDATE SET
+                row_number = excluded.row_number,
+                status = excluded.status
+            """,
+            (message_id, row_number, status),
+        )
+        self._connection.commit()
+
     def record_successful_sync(
         self,
         checkpoint: str,
@@ -172,6 +228,13 @@ class SqliteTrackerState:
             self._connection.executemany(
                 """
                 DELETE FROM pending_application_writes
+                WHERE gmail_message_id = ?
+                """,
+                ((message_id,) for message_id in message_ids),
+            )
+            self._connection.executemany(
+                """
+                DELETE FROM pending_status_updates
                 WHERE gmail_message_id = ?
                 """,
                 ((message_id,) for message_id in message_ids),

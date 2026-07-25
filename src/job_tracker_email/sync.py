@@ -4,6 +4,9 @@ from dataclasses import dataclass
 from typing import Literal
 
 
+ApplicationStatus = Literal["Active", "Rejected", "Offer", "Withdrawn"]
+
+
 @dataclass(frozen=True)
 class GmailMessage:
     message_id: str
@@ -32,7 +35,7 @@ class Application:
     company: str
     position: str
     application_date: str
-    status: Literal["Active"] = "Active"
+    status: ApplicationStatus = "Active"
     stage: str = ""
 
 
@@ -41,6 +44,15 @@ class ReviewProposal:
     """Classifier result for candidacy evidence that needs manual review."""
 
     reason: str
+
+
+@dataclass(frozen=True)
+class StatusUpdate:
+    """A conclusive outcome for one existing Application."""
+
+    company: str
+    position: str
+    status: ApplicationStatus
 
 
 @dataclass(frozen=True)
@@ -56,3 +68,9 @@ class NeedsReview:
 class PendingApplicationWrite:
     application: Application
     matching_rows_before_write: int
+
+
+@dataclass(frozen=True)
+class PendingStatusUpdate:
+    row_number: int
+    status: ApplicationStatus

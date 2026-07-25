@@ -8,6 +8,7 @@ from job_tracker_email.sync import (
     Application,
     ClassificationInput,
     ReviewProposal,
+    StatusUpdate,
 )
 
 
@@ -30,6 +31,13 @@ submission-date evidence; for unsupported or unclear language; and for an
 alternate Position without separate submission or candidacy evidence. Give a
 concise reason for needs_review. Do not use a later hiring-message date as an
 Application Date. Ignore and new_application must have an empty reason.
+
+Return status_update only when a later message conclusively identifies an
+existing Application's Company and Position. Use Active for interviews and
+advancement, Rejected for explicit rejection or a filled, closed, or cancelled
+Position, Offer only for an explicit employment offer, and Withdrawn only when
+the applicant ends an active candidacy before an offer. A declined offer is an
+Offer update. If identity or Status is uncertain, return needs_review.
 """.strip()
 
 
@@ -38,11 +46,17 @@ CLASSIFICATION_SCHEMA: dict[str, Any] = {
     "properties": {
         "kind": {
             "type": "string",
-            "enum": ["new_application", "needs_review", "ignore"],
+            "enum": [
+                "new_application",
+                "status_update",
+                "needs_review",
+                "ignore",
+            ],
         },
         "company": {"type": "string"},
         "position": {"type": "string"},
         "application_date": {"type": "string"},
+        "status": {"type": "string"},
         "reason": {"type": "string"},
     },
     "required": [
@@ -50,6 +64,7 @@ CLASSIFICATION_SCHEMA: dict[str, Any] = {
         "company",
         "position",
         "application_date",
+        "status",
         "reason",
     ],
     "additionalProperties": False,
@@ -71,7 +86,7 @@ class OpenAIApplicationClassifier:
     def classify(
         self,
         message: ClassificationInput,
-    ) -> Application | ReviewProposal | None:
+    ) -> Application | ReviewProposal | StatusUpdate | None:
         client = (
             self._provided_client
             if self._provided_client is not None
@@ -110,6 +125,23 @@ class OpenAIApplicationClassifier:
                     "OpenAI classification omitted a review reason."
                 )
             return ReviewProposal(reason=reason)
+        if result["kind"] == "status_update":
+            company = str(result["company"]).strip()
+            position = str(result["position"]).strip()
+            status = str(result["status"]).strip()
+            if not company or not position:
+                raise RuntimeError(
+                    "OpenAI classification omitted Status update identity."
+                )
+            if status not in {"Active", "Rejected", "Offer", "Withdrawn"}:
+                raise RuntimeError(
+                    "OpenAI classification returned an invalid Status."
+                )
+            return StatusUpdate(
+                company=company,
+                position=position,
+                status=status,  # type: ignore[arg-type]
+            )
         if result["kind"] != "new_application":
             raise RuntimeError("OpenAI classification returned an unknown kind.")
 
