@@ -26,6 +26,7 @@ from job_tracker_email.sync import (
     MailboxScan,
     PendingApplicationWrite,
     PendingStatusUpdate,
+    SheetStatusUpdate,
     NeedsReview,
     ReviewProposal,
     StatusUpdate,
@@ -97,6 +98,8 @@ class TrackerState(Protocol):
         application: Application,
     ) -> None: ...
 
+    def clear_application_thread(self, thread_id: str) -> None: ...
+
     def record_successful_sync(
         self,
         checkpoint: str,
@@ -144,11 +147,23 @@ class ApplicationSheet(Protocol):
         status: ApplicationStatus,
     ) -> None: ...
 
+    def apply_recovery_changes(
+        self,
+        spreadsheet_id: str,
+        status_updates: tuple[SheetStatusUpdate, ...],
+        reviews: tuple[NeedsReview, ...],
+    ) -> None: ...
+
     def count_matching_needs_review(
         self,
         spreadsheet_id: str,
         review: NeedsReview,
     ) -> int: ...
+
+    def list_needs_review(
+        self,
+        spreadsheet_id: str,
+    ) -> tuple[NeedsReview, ...]: ...
 
     def append_needs_review(
         self,
@@ -181,6 +196,13 @@ class StatusUpdateProposal:
     status: ApplicationStatus
 
 
+@dataclass(frozen=True)
+class RecoveredThreadMapping:
+    thread_id: str
+    row_number: int
+    application: Application
+
+
 def run(
     *,
     workspace: GoogleWorkspace,
@@ -190,9 +212,16 @@ def run(
     sync: SyncAdapters | None = None,
     start_date: date | None = None,
     allow_large_import: bool = False,
+    full_rescan: bool = False,
+    recovery_spreadsheet_id: str | None = None,
 ) -> int:
     error_output = sys.stderr if stderr is None else stderr
-    spreadsheet_id = state.get_spreadsheet_id()
+    saved_spreadsheet_id = state.get_spreadsheet_id()
+    spreadsheet_id = recovery_spreadsheet_id or saved_spreadsheet_id
+    should_save_recovery_spreadsheet_id = (
+        recovery_spreadsheet_id is not None
+        and recovery_spreadsheet_id != saved_spreadsheet_id
+    )
     if sync is None:
         if spreadsheet_id is not None:
             stdout.write("Reusing Job Application Tracker.\n")
@@ -207,15 +236,18 @@ def run(
 
     checkpoint = state.get_successful_checkpoint()
     scan = sync.mailbox.find_messages(
-        checkpoint,
-        start_date=start_date if checkpoint is None else None,
+        None if full_rescan else checkpoint,
+        start_date=(
+            start_date if not full_rescan and checkpoint is None else None
+        ),
     )
     messages = tuple(
         sorted(
             (
                 message
                 for message in scan.messages
-                if not state.has_processed_message(message.message_id)
+                if full_rescan
+                or not state.has_processed_message(message.message_id)
             ),
             key=lambda message: message.timestamp,
         )
@@ -231,6 +263,11 @@ def run(
         if spreadsheet_id is not None
         else ()
     )
+    existing_reviews = (
+        sync.application_sheet.list_needs_review(spreadsheet_id)
+        if spreadsheet_id is not None
+        else ()
+    )
     applications_by_row = {
         row_number: application
         for row_number, application in enumerate(existing_applications, start=2)
@@ -240,15 +277,22 @@ def run(
     application_proposals: list[tuple[str, Application]] = []
     status_update_proposals: list[StatusUpdateProposal] = []
     review_proposals: list[tuple[str, NeedsReview]] = []
+    recovered_thread_mappings: list[RecoveredThreadMapping] = []
+    recovered_applications_by_thread: dict[str, ThreadApplication] = {}
+    ambiguous_recovered_threads: set[str] = set()
     message_threads = {
         message.message_id: message.thread_id for message in messages
     }
     for message in messages:
-        pending_write = state.get_pending_application_write(
-            message.message_id
+        pending_write = (
+            None
+            if full_rescan
+            else state.get_pending_application_write(message.message_id)
         )
-        pending_status_update = state.get_pending_status_update(
-            message.message_id
+        pending_status_update = (
+            None
+            if full_rescan
+            else state.get_pending_status_update(message.message_id)
         )
         if pending_status_update is not None:
             status_update_proposals.append(
@@ -274,12 +318,94 @@ def run(
         else:
             outcome = pending_write.application
         if isinstance(outcome, Application):
-            application_proposals.append((message.message_id, outcome))
+            if not full_rescan:
+                application_proposals.append((message.message_id, outcome))
+                continue
+            matching_applications = [
+                (row_number, application)
+                for row_number, application in applications_by_row.items()
+                if application.company == outcome.company
+                and application.position == outcome.position
+                and application.application_date == outcome.application_date
+            ]
+            if len(matching_applications) == 1:
+                row_number, application = matching_applications[0]
+                recovered_thread_mappings.append(
+                    RecoveredThreadMapping(
+                        thread_id=message.thread_id,
+                        row_number=row_number,
+                        application=application,
+                    )
+                )
+                if message.thread_id:
+                    recovered_application = ThreadApplication(
+                        row_number=row_number,
+                        company=application.company,
+                        position=application.position,
+                        application_date=application.application_date,
+                    )
+                    existing_recovered_application = (
+                        recovered_applications_by_thread.get(message.thread_id)
+                    )
+                    if (
+                        existing_recovered_application is None
+                        and message.thread_id not in ambiguous_recovered_threads
+                    ):
+                        recovered_applications_by_thread[message.thread_id] = (
+                            recovered_application
+                        )
+                    elif existing_recovered_application != recovered_application:
+                        recovered_applications_by_thread.pop(
+                            message.thread_id,
+                            None,
+                        )
+                        ambiguous_recovered_threads.add(message.thread_id)
+            elif not matching_applications:
+                review_proposals.append(
+                    (
+                        message.message_id,
+                        _needs_review(
+                            message,
+                            "Historical Application does not match an "
+                            "existing Application.",
+                        ),
+                    )
+                )
+            else:
+                review_proposals.append(
+                    (
+                        message.message_id,
+                        _needs_review(
+                            message,
+                            "Multiple existing Applications match this "
+                            "historical Application.",
+                        ),
+                    )
+                )
         elif isinstance(outcome, StatusUpdate):
+            if (
+                full_rescan
+                and message.thread_id in ambiguous_recovered_threads
+            ):
+                review_proposals.append(
+                    (
+                        message.message_id,
+                        _needs_review(
+                            message,
+                            "Gmail thread maps to multiple existing "
+                            "Applications during recovery.",
+                        ),
+                    )
+                )
+                continue
             thread_application = (
-                state.get_application_for_thread(message.thread_id)
-                if message.thread_id
-                else None
+                recovered_applications_by_thread.get(message.thread_id)
+                if full_rescan
+                else (
+                    state.get_application_for_thread(message.thread_id)
+                    if message.thread_id
+                    else None
+                )
             )
             if thread_application is not None:
                 mapped_application = applications_by_row.get(
@@ -401,6 +527,12 @@ def run(
                 )
             )
 
+    review_proposals = [
+        proposal
+        for proposal in review_proposals
+        if proposal[1] not in existing_reviews
+    ]
+
     if (
         not application_proposals
         and not status_update_proposals
@@ -412,6 +544,13 @@ def run(
             )
             state.save_spreadsheet_id(spreadsheet_id)
             stdout.write("Created Job Application Tracker.\n")
+        if should_save_recovery_spreadsheet_id:
+            state.save_spreadsheet_id(spreadsheet_id)
+        _record_recovered_thread_mappings(
+            state,
+            recovered_thread_mappings,
+            ambiguous_recovered_threads,
+        )
         state.record_successful_sync(
             scan.checkpoint,
             tuple(message.message_id for message in messages),
@@ -460,82 +599,114 @@ def run(
         stdout.write("Created Job Application Tracker.\n")
 
     try:
-        for message_id, application in application_proposals:
-            pending_write = state.get_pending_application_write(
-                message_id
+        if full_rescan:
+            for proposal in status_update_proposals:
+                if (
+                    state.get_pending_status_update(proposal.message_id)
+                    is None
+                ):
+                    state.record_pending_status_update(
+                        proposal.message_id,
+                        proposal.row_number,
+                        proposal.status,
+                    )
+            sync.application_sheet.apply_recovery_changes(
+                spreadsheet_id,
+                tuple(
+                    SheetStatusUpdate(
+                        row_number=proposal.row_number,
+                        status=proposal.status,
+                    )
+                    for proposal in status_update_proposals
+                ),
+                tuple(review for _, review in review_proposals),
             )
-            if pending_write is None:
-                matching_rows_before_write = (
-                    sync.application_sheet.count_matching_applications(
+        else:
+            for message_id, application in application_proposals:
+                pending_write = state.get_pending_application_write(
+                    message_id
+                )
+                if pending_write is None:
+                    matching_rows_before_write = (
+                        sync.application_sheet.count_matching_applications(
+                            spreadsheet_id,
+                            application,
+                        )
+                    )
+                    state.record_pending_application_write(
+                        message_id,
+                        application,
+                        matching_rows_before_write,
+                    )
+                    should_append = True
+                else:
+                    current_matching_rows = (
+                        sync.application_sheet.count_matching_applications(
+                            spreadsheet_id,
+                            application,
+                        )
+                    )
+                    should_append = (
+                        current_matching_rows
+                        <= pending_write.matching_rows_before_write
+                    )
+                if should_append:
+                    row_number = sync.application_sheet.append_application(
                         spreadsheet_id,
                         application,
                     )
-                )
-                state.record_pending_application_write(
-                    message_id,
-                    application,
-                    matching_rows_before_write,
-                )
-                should_append = True
-            else:
-                current_matching_rows = (
-                    sync.application_sheet.count_matching_applications(
-                        spreadsheet_id,
+                    state.record_application_thread(
+                        message_threads[message_id],
+                        row_number,
                         application,
                     )
+            for proposal in status_update_proposals:
+                pending_status_update = state.get_pending_status_update(
+                    proposal.message_id
                 )
-                should_append = (
-                    current_matching_rows
-                    <= pending_write.matching_rows_before_write
-                )
-            if should_append:
-                row_number = sync.application_sheet.append_application(
-                    spreadsheet_id,
-                    application,
-                )
-                state.record_application_thread(
-                    message_threads[message_id],
-                    row_number,
-                    application,
-                )
-        for proposal in status_update_proposals:
-            pending_status_update = state.get_pending_status_update(
-                proposal.message_id
-            )
-            if pending_status_update is None:
-                state.record_pending_status_update(
-                    proposal.message_id,
-                    proposal.row_number,
-                    proposal.status,
-                )
-            current_application = sync.application_sheet.list_applications(
-                spreadsheet_id
-            )[proposal.row_number - 2]
-            if current_application is None:
-                raise RuntimeError("The Application row no longer has a Status.")
-            if current_application.status != proposal.status:
-                sync.application_sheet.update_application_status(
-                    spreadsheet_id,
-                    proposal.row_number,
-                    proposal.status,
-                )
-        for _, review in review_proposals:
-            if (
-                sync.application_sheet.count_matching_needs_review(
-                    spreadsheet_id,
-                    review,
-                )
-                == 0
-            ):
-                sync.application_sheet.append_needs_review(
-                    spreadsheet_id,
-                    review,
-                )
+                if pending_status_update is None:
+                    state.record_pending_status_update(
+                        proposal.message_id,
+                        proposal.row_number,
+                        proposal.status,
+                    )
+                current_application = sync.application_sheet.list_applications(
+                    spreadsheet_id
+                )[proposal.row_number - 2]
+                if current_application is None:
+                    raise RuntimeError(
+                        "The Application row no longer has a Status."
+                    )
+                if current_application.status != proposal.status:
+                    sync.application_sheet.update_application_status(
+                        spreadsheet_id,
+                        proposal.row_number,
+                        proposal.status,
+                    )
+            for _, review in review_proposals:
+                if (
+                    sync.application_sheet.count_matching_needs_review(
+                        spreadsheet_id,
+                        review,
+                    )
+                    == 0
+                ):
+                    sync.application_sheet.append_needs_review(
+                        spreadsheet_id,
+                        review,
+                    )
     except Exception:
         error_output.write(
             "Could not update Job Application Tracker. Try again.\n"
         )
         return 1
+    if should_save_recovery_spreadsheet_id:
+        state.save_spreadsheet_id(spreadsheet_id)
+    _record_recovered_thread_mappings(
+        state,
+        recovered_thread_mappings,
+        ambiguous_recovered_threads,
+    )
     state.record_successful_sync(
         scan.checkpoint,
         tuple(message.message_id for message in messages),
@@ -583,6 +754,8 @@ def main(
     output = sys.stdout if stdout is None else stdout
     error_output = sys.stderr if stderr is None else stderr
     arguments = _parser().parse_args(argv)
+    if arguments.spreadsheet_id is not None and not arguments.full_rescan:
+        _parser().error("--spreadsheet-id requires --full-rescan")
     data_dir = arguments.data_dir
     client_secrets_path = arguments.client_secrets
     if client_secrets_path is None:
@@ -625,6 +798,8 @@ def main(
                 ),
                 start_date=arguments.start_date,
                 allow_large_import=arguments.allow_large_import,
+                full_rescan=arguments.full_rescan,
+                recovery_spreadsheet_id=arguments.spreadsheet_id,
             )
     except Exception:
         error_output.write(
@@ -673,6 +848,15 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="classify a batch larger than 500 messages",
     )
+    parser.add_argument(
+        "--full-rescan",
+        action="store_true",
+        help="re-evaluate all eligible Gmail history conservatively",
+    )
+    parser.add_argument(
+        "--spreadsheet-id",
+        help="existing tracker spreadsheet ID to recover during a full rescan",
+    )
     return parser
 
 
@@ -690,3 +874,20 @@ def _parse_start_date(value: str) -> date:
         raise argparse.ArgumentTypeError(
             "must be a calendar date in YYYY-MM-DD format"
         ) from error
+
+
+def _record_recovered_thread_mappings(
+    state: TrackerState,
+    mappings: list[RecoveredThreadMapping],
+    ambiguous_threads: set[str],
+) -> None:
+    for mapping in mappings:
+        if mapping.thread_id in ambiguous_threads:
+            continue
+        state.record_application_thread(
+            mapping.thread_id,
+            mapping.row_number,
+            mapping.application,
+        )
+    for thread_id in ambiguous_threads:
+        state.clear_application_thread(thread_id)

@@ -240,6 +240,25 @@ class SqliteTrackerState:
         )
         self._connection.commit()
 
+    def clear_application_thread(self, thread_id: str) -> None:
+        if not thread_id:
+            return
+        with self._connection:
+            self._connection.execute(
+                """
+                DELETE FROM application_threads
+                WHERE gmail_thread_id = ?
+                """,
+                (thread_id,),
+            )
+            self._connection.execute(
+                """
+                DELETE FROM application_thread_identities
+                WHERE gmail_thread_id = ?
+                """,
+                (thread_id,),
+            )
+
     def record_pending_application_write(
         self,
         message_id: str,

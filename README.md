@@ -59,6 +59,22 @@ count, deliberately continue a known large import with:
 job-tracker-email --allow-large-import
 ```
 
+To conservatively rebuild local bookkeeping from all eligible Gmail history,
+run a full rescan. It preserves existing Application rows, routes unmatched or
+ambiguous historical evidence to Needs Review, and uses the same confirmation
+step as a normal sync:
+
+```bash
+job-tracker-email --full-rescan
+```
+
+If the local state database was lost, provide the existing tracker spreadsheet
+ID so the command can recover against that Sheet instead of creating another:
+
+```bash
+job-tracker-email --full-rescan --spreadsheet-id your-spreadsheet-id
+```
+
 For each clearly confirmed Application, the command previews Company,
 Position, Application Date, Status, and Stage. Enter `y` or `yes` to append the
 row. Any other response cancels the batch without advancing the checkpoint.

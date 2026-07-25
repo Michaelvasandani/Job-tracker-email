@@ -20,6 +20,7 @@ from job_tracker_email.sync import (
     ApplicationStatus,
     MailboxScan,
     NeedsReview,
+    SheetStatusUpdate,
 )
 
 
@@ -77,12 +78,26 @@ class FakeGoogleWorkspace:
     ) -> None:
         raise AssertionError("An empty mailbox cannot update an Application.")
 
+    def apply_recovery_changes(
+        self,
+        spreadsheet_id: str,
+        status_updates: tuple[SheetStatusUpdate, ...],
+        reviews: tuple[NeedsReview, ...],
+    ) -> None:
+        raise AssertionError("An empty mailbox cannot update an Application.")
+
     def count_matching_needs_review(
         self,
         spreadsheet_id: str,
         review: NeedsReview,
     ) -> int:
         return 0
+
+    def list_needs_review(
+        self,
+        spreadsheet_id: str,
+    ) -> tuple[NeedsReview, ...]:
+        return ()
 
     def append_needs_review(
         self,
@@ -340,11 +355,25 @@ def test_command_does_not_print_secrets_from_google_errors(
         ) -> None:
             raise AssertionError("Spreadsheet creation must fail first.")
 
+        def apply_recovery_changes(
+            self,
+            spreadsheet_id: str,
+            status_updates: tuple[SheetStatusUpdate, ...],
+            reviews: tuple[NeedsReview, ...],
+        ) -> None:
+            raise AssertionError("Spreadsheet creation must fail first.")
+
         def count_matching_needs_review(
             self,
             spreadsheet_id: str,
             review: NeedsReview,
         ) -> int:
+            raise AssertionError("Spreadsheet creation must fail first.")
+
+        def list_needs_review(
+            self,
+            spreadsheet_id: str,
+        ) -> tuple[NeedsReview, ...]:
             raise AssertionError("Spreadsheet creation must fail first.")
 
         def append_needs_review(

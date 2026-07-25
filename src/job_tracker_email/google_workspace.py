@@ -15,6 +15,7 @@ from job_tracker_email.sync import (
     GmailMessage,
     MailboxScan,
     NeedsReview,
+    SheetStatusUpdate,
     parse_application_status,
 )
 
@@ -210,6 +211,94 @@ class GoogleApiWorkspace:
             .execute()
         )
 
+    def apply_recovery_changes(
+        self,
+        spreadsheet_id: str,
+        status_updates: tuple[SheetStatusUpdate, ...],
+        reviews: tuple[NeedsReview, ...],
+    ) -> None:
+        if not status_updates and not reviews:
+            return
+        service = self._build_google_service("sheets", "v4")
+        spreadsheet = (
+            service.spreadsheets()
+            .get(
+                spreadsheetId=spreadsheet_id,
+                fields="sheets.properties(sheetId,title)",
+            )
+            .execute()
+        )
+        sheet_ids = {
+            str(sheet["properties"]["title"]): int(
+                sheet["properties"]["sheetId"]
+            )
+            for sheet in spreadsheet.get("sheets", [])
+            if isinstance(sheet, dict)
+            and isinstance(sheet.get("properties"), dict)
+            and isinstance(sheet["properties"].get("title"), str)
+            and isinstance(sheet["properties"].get("sheetId"), int)
+        }
+        applications_sheet_id = sheet_ids.get("Applications")
+        reviews_sheet_id = sheet_ids.get("Needs Review")
+        if applications_sheet_id is None or reviews_sheet_id is None:
+            raise RuntimeError("Tracker spreadsheet is missing a required tab.")
+        requests: list[dict[str, Any]] = [
+            {
+                "updateCells": {
+                    "range": {
+                        "sheetId": applications_sheet_id,
+                        "startRowIndex": update.row_number - 1,
+                        "endRowIndex": update.row_number,
+                        "startColumnIndex": 3,
+                        "endColumnIndex": 4,
+                    },
+                    "rows": [
+                        {
+                            "values": [
+                                {
+                                    "userEnteredValue": {
+                                        "stringValue": update.status
+                                    }
+                                }
+                            ]
+                        }
+                    ],
+                    "fields": "userEnteredValue",
+                }
+            }
+            for update in status_updates
+        ]
+        if reviews:
+            requests.append(
+                {
+                    "appendCells": {
+                        "sheetId": reviews_sheet_id,
+                        "rows": [
+                            {
+                                "values": [
+                                    {
+                                        "userEnteredValue": {
+                                            "stringValue": value
+                                        }
+                                    }
+                                    for value in self._needs_review_row(review)
+                                ]
+                            }
+                            for review in reviews
+                        ],
+                        "fields": "userEnteredValue",
+                    }
+                }
+            )
+        (
+            service.spreadsheets()
+            .batchUpdate(
+                spreadsheetId=spreadsheet_id,
+                body={"requests": requests},
+            )
+            .execute()
+        )
+
     def append_needs_review(
         self,
         spreadsheet_id: str,
@@ -231,6 +320,32 @@ class GoogleApiWorkspace:
             "Needs Review!A2:E",
             self._needs_review_row(review),
         )
+
+    def list_needs_review(
+        self,
+        spreadsheet_id: str,
+    ) -> tuple[NeedsReview, ...]:
+        service = self._build_google_service("sheets", "v4")
+        response = (
+            service.spreadsheets()
+            .values()
+            .get(spreadsheetId=spreadsheet_id, range="Needs Review!A2:E")
+            .execute()
+        )
+        reviews: list[NeedsReview] = []
+        for row in response.get("values", []):
+            if not isinstance(row, list) or len(row) < 5:
+                continue
+            reviews.append(
+                NeedsReview(
+                    email_date=str(row[0]),
+                    sender=str(row[1]),
+                    subject=str(row[2]),
+                    gmail_link=str(row[3]),
+                    reason=str(row[4]),
+                )
+            )
+        return tuple(reviews)
 
     def _append_row(
         self,

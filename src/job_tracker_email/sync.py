@@ -87,6 +87,12 @@ class PendingStatusUpdate:
 
 
 @dataclass(frozen=True)
+class SheetStatusUpdate:
+    row_number: int
+    status: ApplicationStatus
+
+
+@dataclass(frozen=True)
 class ThreadApplication:
     row_number: int
     company: str

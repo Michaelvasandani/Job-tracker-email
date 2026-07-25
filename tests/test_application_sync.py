@@ -27,6 +27,7 @@ from job_tracker_email.sync import (
     MailboxScan,
     NeedsReview,
     ReviewProposal,
+    SheetStatusUpdate,
     StatusUpdate,
     ThreadApplication,
 )
@@ -115,6 +116,16 @@ class RecordingApplicationSheet:
     ) -> int:
         return self.review_rows.count((spreadsheet_id, review))
 
+    def list_needs_review(
+        self,
+        spreadsheet_id: str,
+    ) -> tuple[NeedsReview, ...]:
+        return tuple(
+            review
+            for row_spreadsheet_id, review in self.review_rows
+            if row_spreadsheet_id == spreadsheet_id
+        )
+
     def list_applications(
         self,
         spreadsheet_id: str,
@@ -138,6 +149,21 @@ class RecordingApplicationSheet:
         row_spreadsheet_id, application = self.rows[row_index]
         assert row_spreadsheet_id == spreadsheet_id
         self.rows[row_index] = (row_spreadsheet_id, replace(application, status=status))
+
+    def apply_recovery_changes(
+        self,
+        spreadsheet_id: str,
+        status_updates: tuple[SheetStatusUpdate, ...],
+        reviews: tuple[NeedsReview, ...],
+    ) -> None:
+        for update in status_updates:
+            self.update_application_status(
+                spreadsheet_id,
+                update.row_number,
+                update.status,
+            )
+        for review in reviews:
+            self.append_needs_review(spreadsheet_id, review)
 
 
 class FailOnceApplicationSheet(RecordingApplicationSheet):
@@ -1790,3 +1816,850 @@ def test_explicit_override_allows_large_import_to_reach_preview(
     assert not workspace.created
     with SqliteTrackerState(tmp_path / "tracker.sqlite3") as state:
         assert state.get_successful_checkpoint() is None
+
+
+def test_full_rescan_rebuilds_a_unique_application_mapping_without_appending(
+    tmp_path: Path,
+) -> None:
+    application = Application(
+        company="Example Corp",
+        position="Engineer",
+        application_date="2026-01-02",
+    )
+    workspace = SyncingWorkspace(
+        MailboxScan(
+            messages=(
+                GmailMessage(
+                    message_id="historical-application",
+                    thread_id="historical-thread",
+                    sender="jobs@example.com",
+                    subject="Application received",
+                    timestamp="2026-01-02T12:00:00Z",
+                    normalized_body="We received your application.",
+                ),
+            ),
+            checkpoint="historical-checkpoint",
+        )
+    )
+    workspace.rows = [("spreadsheet-recovery", application)]
+    classifier = RecordingClassifier(application)
+
+    with SqliteTrackerState(tmp_path / "tracker.sqlite3") as state:
+        state.save_spreadsheet_id("spreadsheet-recovery")
+        state.record_successful_sync(
+            "incremental-checkpoint", ("historical-application",)
+        )
+
+    exit_code = main(
+        ["--data-dir", str(tmp_path), "--full-rescan"],
+        workspace_factory=lambda config: workspace,
+        classifier_factory=lambda: classifier,
+        stdout=StringIO(),
+    )
+
+    assert exit_code == 0
+    assert workspace.scan_requests == [(None, None)]
+    assert len(classifier.received) == 1
+    assert workspace.rows == [("spreadsheet-recovery", application)]
+    with SqliteTrackerState(tmp_path / "tracker.sqlite3") as state:
+        assert state.get_successful_checkpoint() == "historical-checkpoint"
+        assert state.get_application_for_thread("historical-thread") == (
+            ThreadApplication(
+                row_number=2,
+                company="Example Corp",
+                position="Engineer",
+                application_date="2026-01-02",
+            )
+        )
+
+
+def test_full_rescan_does_not_repreview_an_existing_unmatched_review(
+    tmp_path: Path,
+) -> None:
+    message = GmailMessage(
+        message_id="deleted-application",
+        sender="jobs@example.com",
+        subject="Application received",
+        timestamp="2026-01-02T12:00:00Z",
+        normalized_body="We received your application.",
+    )
+    review = NeedsReview(
+        email_date="2026-01-02",
+        sender="jobs@example.com",
+        subject="Application received",
+        gmail_link=(
+            "https://mail.google.com/mail/u/0/#all/deleted-application"
+        ),
+        reason=(
+            "Historical Application does not match an existing Application."
+        ),
+    )
+    workspace = SyncingWorkspace(
+        MailboxScan(messages=(message,), checkpoint="rescan-checkpoint")
+    )
+    workspace.review_rows = [("spreadsheet-recovery", review)]
+
+    with SqliteTrackerState(tmp_path / "tracker.sqlite3") as state:
+        state.save_spreadsheet_id("spreadsheet-recovery")
+        exit_code = run(
+            workspace=ExistingTracker(),
+            state=state,
+            stdout=StringIO(),
+            sync=SyncAdapters(
+                mailbox=workspace,
+                classifier=RecordingClassifier(
+                    Application(
+                        company="Example Corp",
+                        position="Engineer",
+                        application_date="2026-01-02",
+                    )
+                ),
+                application_sheet=workspace,
+                confirm=lambda: (_ for _ in ()).throw(
+                    AssertionError("Existing review needs no confirmation.")
+                ),
+            ),
+            full_rescan=True,
+        )
+
+        assert state.get_successful_checkpoint() == "rescan-checkpoint"
+
+    assert exit_code == 0
+    assert workspace.review_rows == [("spreadsheet-recovery", review)]
+
+
+def test_full_rescan_recovers_missing_state_with_a_spreadsheet_id(
+    tmp_path: Path,
+) -> None:
+    application = Application(
+        company="Example Corp",
+        position="Engineer",
+        application_date="2026-01-02",
+    )
+    workspace = SyncingWorkspace(
+        MailboxScan(
+            messages=(
+                GmailMessage(
+                    message_id="recover-missing-state",
+                    thread_id="recover-thread",
+                    sender="jobs@example.com",
+                    subject="Application received",
+                    timestamp="2026-01-02T12:00:00Z",
+                    normalized_body="We received your application.",
+                ),
+            ),
+            checkpoint="recovery-checkpoint",
+        )
+    )
+    workspace.rows = [("spreadsheet-recovery", application)]
+
+    exit_code = main(
+        [
+            "--data-dir",
+            str(tmp_path),
+            "--full-rescan",
+            "--spreadsheet-id",
+            "spreadsheet-recovery",
+        ],
+        workspace_factory=lambda config: workspace,
+        classifier_factory=lambda: RecordingClassifier(application),
+        stdout=StringIO(),
+    )
+
+    assert exit_code == 0
+    assert not workspace.created
+    with SqliteTrackerState(tmp_path / "tracker.sqlite3") as state:
+        assert state.get_spreadsheet_id() == "spreadsheet-recovery"
+        assert state.get_successful_checkpoint() == "recovery-checkpoint"
+        assert state.get_application_for_thread("recover-thread") is not None
+
+
+def test_full_rescan_replaces_an_inconsistent_spreadsheet_id_after_recovery(
+    tmp_path: Path,
+) -> None:
+    application = Application(
+        company="Example Corp",
+        position="Engineer",
+        application_date="2026-01-02",
+    )
+    workspace = SyncingWorkspace(
+        MailboxScan(
+            messages=(
+                GmailMessage(
+                    message_id="recover-inconsistent-state",
+                    sender="jobs@example.com",
+                    subject="Application received",
+                    timestamp="2026-01-02T12:00:00Z",
+                    normalized_body="We received your application.",
+                ),
+            ),
+            checkpoint="recovery-checkpoint",
+        )
+    )
+    workspace.rows = [("spreadsheet-recovery", application)]
+    with SqliteTrackerState(tmp_path / "tracker.sqlite3") as state:
+        state.save_spreadsheet_id("stale-spreadsheet")
+
+    exit_code = main(
+        [
+            "--data-dir",
+            str(tmp_path),
+            "--full-rescan",
+            "--spreadsheet-id",
+            "spreadsheet-recovery",
+        ],
+        workspace_factory=lambda config: workspace,
+        classifier_factory=lambda: RecordingClassifier(application),
+        stdout=StringIO(),
+    )
+
+    assert exit_code == 0
+    with SqliteTrackerState(tmp_path / "tracker.sqlite3") as state:
+        assert state.get_spreadsheet_id() == "spreadsheet-recovery"
+        assert state.get_successful_checkpoint() == "recovery-checkpoint"
+
+
+def test_cancelled_full_rescan_keeps_the_prior_spreadsheet_id(
+    tmp_path: Path,
+) -> None:
+    workspace = SyncingWorkspace(
+        MailboxScan(
+            messages=(
+                GmailMessage(
+                    message_id="unmatched-history",
+                    sender="jobs@example.com",
+                    subject="Application received",
+                    timestamp="2026-01-02T12:00:00Z",
+                    normalized_body="We received your application.",
+                ),
+            ),
+            checkpoint="recovery-checkpoint",
+        )
+    )
+    with SqliteTrackerState(tmp_path / "tracker.sqlite3") as state:
+        state.save_spreadsheet_id("stale-spreadsheet")
+
+    exit_code = main(
+        [
+            "--data-dir",
+            str(tmp_path),
+            "--full-rescan",
+            "--spreadsheet-id",
+            "spreadsheet-recovery",
+        ],
+        workspace_factory=lambda config: workspace,
+        classifier_factory=lambda: RecordingClassifier(
+            Application(
+                company="Example Corp",
+                position="Engineer",
+                application_date="2026-01-02",
+            )
+        ),
+        stdin=StringIO("no\n"),
+        stdout=StringIO(),
+    )
+
+    assert exit_code == 0
+    with SqliteTrackerState(tmp_path / "tracker.sqlite3") as state:
+        assert state.get_spreadsheet_id() == "stale-spreadsheet"
+        assert state.get_successful_checkpoint() is None
+
+
+def test_full_rescan_records_recovered_threads_after_a_confirmed_status_plan(
+    tmp_path: Path,
+) -> None:
+    application = Application(
+        company="Example Corp",
+        position="Engineer",
+        application_date="2026-01-02",
+    )
+    workspace = SyncingWorkspace(
+        MailboxScan(
+            messages=(
+                GmailMessage(
+                    message_id="historical-application",
+                    thread_id="historical-thread",
+                    sender="jobs@example.com",
+                    subject="Application received",
+                    timestamp="2026-01-02T12:00:00Z",
+                    normalized_body="We received your application.",
+                ),
+                GmailMessage(
+                    message_id="historical-offer",
+                    thread_id="historical-thread",
+                    sender="jobs@example.com",
+                    subject="Offer",
+                    timestamp="2026-01-03T12:00:00Z",
+                    normalized_body="We are pleased to offer you the role.",
+                ),
+            ),
+            checkpoint="recovery-checkpoint",
+        )
+    )
+    workspace.rows = [("spreadsheet-recovery", application)]
+
+    with SqliteTrackerState(tmp_path / "tracker.sqlite3") as state:
+        state.save_spreadsheet_id("spreadsheet-recovery")
+        exit_code = run(
+            workspace=ExistingTracker(),
+            state=state,
+            stdout=StringIO(),
+            sync=SyncAdapters(
+                mailbox=workspace,
+                classifier=ScenarioClassifier(
+                    {
+                        "Application received": application,
+                        "Offer": StatusUpdate(
+                            company="Example Corp",
+                            position="Engineer",
+                            status="Offer",
+                        ),
+                    }
+                ),
+                application_sheet=workspace,
+                confirm=lambda: True,
+            ),
+            full_rescan=True,
+        )
+
+        assert state.get_application_for_thread("historical-thread") == (
+            ThreadApplication(
+                row_number=2,
+                company="Example Corp",
+                position="Engineer",
+                application_date="2026-01-02",
+            )
+        )
+
+    assert exit_code == 0
+    assert workspace.rows[0][1].status == "Offer"
+
+
+def test_confirmed_full_rescan_records_an_unmatched_application_once_as_review(
+    tmp_path: Path,
+) -> None:
+    message = GmailMessage(
+        message_id="deleted-application",
+        sender="jobs@example.com",
+        subject="Application received",
+        timestamp="2026-01-02T12:00:00Z",
+        normalized_body="We received your application.",
+    )
+    workspace = SyncingWorkspace(
+        MailboxScan(messages=(message,), checkpoint="rescan-checkpoint")
+    )
+    confirmations = 0
+
+    def confirm() -> bool:
+        nonlocal confirmations
+        confirmations += 1
+        return True
+
+    with SqliteTrackerState(tmp_path / "tracker.sqlite3") as state:
+        state.save_spreadsheet_id("spreadsheet-recovery")
+        sync = SyncAdapters(
+            mailbox=workspace,
+            classifier=RecordingClassifier(
+                Application(
+                    company="Example Corp",
+                    position="Engineer",
+                    application_date="2026-01-02",
+                )
+            ),
+            application_sheet=workspace,
+            confirm=confirm,
+        )
+
+        assert run(
+            workspace=ExistingTracker(),
+            state=state,
+            stdout=StringIO(),
+            sync=sync,
+            full_rescan=True,
+        ) == 0
+        assert run(
+            workspace=ExistingTracker(),
+            state=state,
+            stdout=StringIO(),
+            sync=sync,
+            full_rescan=True,
+        ) == 0
+        assert state.get_successful_checkpoint() == "rescan-checkpoint"
+
+    assert confirmations == 1
+    assert workspace.rows == []
+    assert len(workspace.review_rows) == 1
+    assert workspace.review_rows[0][1].reason == (
+        "Historical Application does not match an existing Application."
+    )
+
+
+def test_full_rescan_routes_ambiguous_application_identity_to_review(
+    tmp_path: Path,
+) -> None:
+    application = Application(
+        company="Example Corp",
+        position="Engineer",
+        application_date="2026-01-02",
+        stage="Manually maintained",
+    )
+    workspace = SyncingWorkspace(
+        MailboxScan(
+            messages=(
+                GmailMessage(
+                    message_id="ambiguous-history",
+                    sender="jobs@example.com",
+                    subject="Application received",
+                    timestamp="2026-01-02T12:00:00Z",
+                    normalized_body="We received your application.",
+                ),
+            ),
+            checkpoint="rescan-checkpoint",
+        )
+    )
+    workspace.rows = [
+        ("spreadsheet-recovery", application),
+        ("spreadsheet-recovery", application),
+    ]
+    stdout = StringIO()
+
+    with SqliteTrackerState(tmp_path / "tracker.sqlite3") as state:
+        state.save_spreadsheet_id("spreadsheet-recovery")
+        exit_code = run(
+            workspace=ExistingTracker(),
+            state=state,
+            stdout=stdout,
+            sync=SyncAdapters(
+                mailbox=workspace,
+                classifier=RecordingClassifier(application),
+                application_sheet=workspace,
+                confirm=lambda: False,
+            ),
+            full_rescan=True,
+        )
+
+        assert state.get_successful_checkpoint() is None
+
+    assert exit_code == 0
+    assert workspace.rows == [
+        ("spreadsheet-recovery", application),
+        ("spreadsheet-recovery", application),
+    ]
+    assert workspace.review_rows == []
+    assert "Multiple existing Applications match this historical Application." in (
+        stdout.getvalue()
+    )
+
+
+def test_normal_incremental_run_does_not_restore_a_deleted_application(
+    tmp_path: Path,
+) -> None:
+    message = GmailMessage(
+        message_id="previously-imported",
+        sender="jobs@example.com",
+        subject="Application received",
+        timestamp="2026-01-02T12:00:00Z",
+        normalized_body="We received your application.",
+    )
+    workspace = SyncingWorkspace(
+        MailboxScan(messages=(message,), checkpoint="next-checkpoint")
+    )
+
+    with SqliteTrackerState(tmp_path / "tracker.sqlite3") as state:
+        state.save_spreadsheet_id("spreadsheet-recovery")
+        state.record_successful_sync("previous-checkpoint", (message.message_id,))
+        exit_code = run(
+            workspace=ExistingTracker(),
+            state=state,
+            stdout=StringIO(),
+            sync=SyncAdapters(
+                mailbox=workspace,
+                classifier=RecordingClassifier(
+                    Application(
+                        company="Example Corp",
+                        position="Engineer",
+                        application_date="2026-01-02",
+                    )
+                ),
+                application_sheet=workspace,
+                confirm=lambda: True,
+            ),
+        )
+
+        assert state.get_successful_checkpoint() == "next-checkpoint"
+
+    assert exit_code == 0
+    assert workspace.rows == []
+
+
+def test_failed_full_rescan_write_preserves_checkpoint_and_recovered_mapping(
+    tmp_path: Path,
+) -> None:
+    class FailingStatusSheet(RecordingApplicationSheet):
+        def update_application_status(
+            self,
+            spreadsheet_id: str,
+            row_number: int,
+            status: ApplicationStatus,
+        ) -> None:
+            raise RuntimeError("status write failed")
+
+    application = Application(
+        company="Example Corp",
+        position="Engineer",
+        application_date="2026-01-02",
+    )
+    sheet = FailingStatusSheet()
+    sheet.rows = [("spreadsheet-recovery", application)]
+    mailbox = FakeMailbox(
+        MailboxScan(
+            messages=(
+                GmailMessage(
+                    message_id="historical-application",
+                    thread_id="historical-thread",
+                    sender="jobs@example.com",
+                    subject="Application received",
+                    timestamp="2026-01-02T12:00:00Z",
+                    normalized_body="We received your application.",
+                ),
+                GmailMessage(
+                    message_id="historical-offer",
+                    thread_id="historical-thread",
+                    sender="jobs@example.com",
+                    subject="Offer",
+                    timestamp="2026-01-03T12:00:00Z",
+                    normalized_body="We are pleased to offer you the role.",
+                ),
+            ),
+            checkpoint="recovery-checkpoint",
+        )
+    )
+
+    with SqliteTrackerState(tmp_path / "tracker.sqlite3") as state:
+        state.save_spreadsheet_id("spreadsheet-recovery")
+        exit_code = run(
+            workspace=ExistingTracker(),
+            state=state,
+            stdout=StringIO(),
+            stderr=StringIO(),
+            sync=SyncAdapters(
+                mailbox=mailbox,
+                classifier=ScenarioClassifier(
+                    {
+                        "Application received": application,
+                        "Offer": StatusUpdate(
+                            company="Example Corp",
+                            position="Engineer",
+                            status="Offer",
+                        ),
+                    }
+                ),
+                application_sheet=sheet,
+                confirm=lambda: True,
+            ),
+            full_rescan=True,
+        )
+
+        assert state.get_successful_checkpoint() is None
+        assert state.get_application_for_thread("historical-thread") is None
+
+    assert exit_code == 1
+    assert sheet.rows == [("spreadsheet-recovery", application)]
+
+
+def test_full_rescan_failure_does_not_leave_an_earlier_status_update_applied(
+    tmp_path: Path,
+) -> None:
+    class AtomicFailureSheet(RecordingApplicationSheet):
+        def append_needs_review(
+            self,
+            spreadsheet_id: str,
+            review: NeedsReview,
+        ) -> None:
+            raise RuntimeError("review write failed")
+
+        def apply_recovery_changes(
+            self,
+            spreadsheet_id: str,
+            status_updates: tuple[SheetStatusUpdate, ...],
+            reviews: tuple[NeedsReview, ...],
+        ) -> None:
+            raise RuntimeError("recovery write failed")
+
+    application = Application(
+        company="Example Corp",
+        position="Engineer",
+        application_date="2026-01-02",
+    )
+    sheet = AtomicFailureSheet()
+    sheet.rows = [("spreadsheet-recovery", application)]
+    mailbox = FakeMailbox(
+        MailboxScan(
+            messages=(
+                GmailMessage(
+                    message_id="historical-application",
+                    thread_id="historical-thread",
+                    sender="jobs@example.com",
+                    subject="Application received",
+                    timestamp="2026-01-02T12:00:00Z",
+                    normalized_body="We received your application.",
+                ),
+                GmailMessage(
+                    message_id="historical-offer",
+                    thread_id="historical-thread",
+                    sender="jobs@example.com",
+                    subject="Offer",
+                    timestamp="2026-01-03T12:00:00Z",
+                    normalized_body="We are pleased to offer you the role.",
+                ),
+                GmailMessage(
+                    message_id="unmatched-history",
+                    sender="jobs@example.com",
+                    subject="Another application",
+                    timestamp="2026-01-04T12:00:00Z",
+                    normalized_body="We received your application.",
+                ),
+            ),
+            checkpoint="recovery-checkpoint",
+        )
+    )
+
+    with SqliteTrackerState(tmp_path / "tracker.sqlite3") as state:
+        state.save_spreadsheet_id("spreadsheet-recovery")
+        exit_code = run(
+            workspace=ExistingTracker(),
+            state=state,
+            stdout=StringIO(),
+            stderr=StringIO(),
+            sync=SyncAdapters(
+                mailbox=mailbox,
+                classifier=ScenarioClassifier(
+                    {
+                        "Application received": application,
+                        "Offer": StatusUpdate(
+                            company="Example Corp",
+                            position="Engineer",
+                            status="Offer",
+                        ),
+                        "Another application": Application(
+                            company="Other Corp",
+                            position="Designer",
+                            application_date="2026-01-04",
+                        ),
+                    }
+                ),
+                application_sheet=sheet,
+                confirm=lambda: True,
+            ),
+            full_rescan=True,
+        )
+
+        assert state.get_successful_checkpoint() is None
+
+    assert exit_code == 1
+    assert sheet.rows == [("spreadsheet-recovery", application)]
+    assert sheet.review_rows == []
+
+
+def test_full_rescan_replaces_a_stale_thread_mapping_before_status_matching(
+    tmp_path: Path,
+) -> None:
+    stale_application = Application(
+        company="Example Corp",
+        position="Engineer",
+        application_date="2026-01-01",
+    )
+    recovered_application = Application(
+        company="Example Corp",
+        position="Engineer",
+        application_date="2026-01-02",
+    )
+    sheet = RecordingApplicationSheet()
+    sheet.rows = [
+        ("spreadsheet-recovery", stale_application),
+        ("spreadsheet-recovery", recovered_application),
+    ]
+    mailbox = FakeMailbox(
+        MailboxScan(
+            messages=(
+                GmailMessage(
+                    message_id="historical-application",
+                    thread_id="historical-thread",
+                    sender="jobs@example.com",
+                    subject="Application received",
+                    timestamp="2026-01-02T12:00:00Z",
+                    normalized_body="We received your application.",
+                ),
+                GmailMessage(
+                    message_id="historical-offer",
+                    thread_id="historical-thread",
+                    sender="jobs@example.com",
+                    subject="Offer",
+                    timestamp="2026-01-03T12:00:00Z",
+                    normalized_body="We are pleased to offer you the role.",
+                ),
+            ),
+            checkpoint="recovery-checkpoint",
+        )
+    )
+
+    with SqliteTrackerState(tmp_path / "tracker.sqlite3") as state:
+        state.save_spreadsheet_id("spreadsheet-recovery")
+        state.record_application_thread(
+            "historical-thread", 2, stale_application
+        )
+        exit_code = run(
+            workspace=ExistingTracker(),
+            state=state,
+            stdout=StringIO(),
+            sync=SyncAdapters(
+                mailbox=mailbox,
+                classifier=ScenarioClassifier(
+                    {
+                        "Application received": recovered_application,
+                        "Offer": StatusUpdate(
+                            company="Example Corp",
+                            position="Engineer",
+                            status="Offer",
+                        ),
+                    }
+                ),
+                application_sheet=sheet,
+                confirm=lambda: True,
+            ),
+            full_rescan=True,
+        )
+
+    assert exit_code == 0
+    assert sheet.rows[0][1].status == "Active"
+    assert sheet.rows[1][1].status == "Offer"
+
+
+def test_full_rescan_ignores_a_stale_pending_status_update(
+    tmp_path: Path,
+) -> None:
+    application = Application(
+        company="Example Corp",
+        position="Engineer",
+        application_date="2026-01-02",
+    )
+    sheet = RecordingApplicationSheet()
+    sheet.rows = [("spreadsheet-recovery", application)]
+    message = GmailMessage(
+        message_id="stale-pending-update",
+        sender="jobs@example.com",
+        subject="Irrelevant",
+        timestamp="2026-01-03T12:00:00Z",
+        normalized_body="No conclusive hiring outcome.",
+    )
+
+    with SqliteTrackerState(tmp_path / "tracker.sqlite3") as state:
+        state.save_spreadsheet_id("spreadsheet-recovery")
+        state.record_pending_status_update("stale-pending-update", 2, "Offer")
+        exit_code = run(
+            workspace=ExistingTracker(),
+            state=state,
+            stdout=StringIO(),
+            sync=SyncAdapters(
+                mailbox=FakeMailbox(
+                    MailboxScan(
+                        messages=(message,),
+                        checkpoint="recovery-checkpoint",
+                    )
+                ),
+                classifier=RecordingClassifier(None),
+                application_sheet=sheet,
+                confirm=lambda: True,
+            ),
+            full_rescan=True,
+        )
+
+    assert exit_code == 0
+    assert sheet.rows == [("spreadsheet-recovery", application)]
+
+
+def test_full_rescan_routes_a_thread_with_multiple_recovered_applications_to_review(
+    tmp_path: Path,
+) -> None:
+    first_application = Application(
+        company="Example Corp",
+        position="Engineer",
+        application_date="2026-01-01",
+    )
+    second_application = Application(
+        company="Example Corp",
+        position="Designer",
+        application_date="2026-01-02",
+    )
+    sheet = RecordingApplicationSheet()
+    sheet.rows = [
+        ("spreadsheet-recovery", first_application),
+        ("spreadsheet-recovery", second_application),
+    ]
+    mailbox = FakeMailbox(
+        MailboxScan(
+            messages=(
+                GmailMessage(
+                    message_id="first-application",
+                    thread_id="shared-thread",
+                    sender="jobs@example.com",
+                    subject="First application",
+                    timestamp="2026-01-01T12:00:00Z",
+                    normalized_body="We received your application.",
+                ),
+                GmailMessage(
+                    message_id="second-application",
+                    thread_id="shared-thread",
+                    sender="jobs@example.com",
+                    subject="Second application",
+                    timestamp="2026-01-02T12:00:00Z",
+                    normalized_body="We received your application.",
+                ),
+                GmailMessage(
+                    message_id="shared-thread-offer",
+                    thread_id="shared-thread",
+                    sender="jobs@example.com",
+                    subject="Offer",
+                    timestamp="2026-01-03T12:00:00Z",
+                    normalized_body="We are pleased to offer you a role.",
+                ),
+            ),
+            checkpoint="recovery-checkpoint",
+        )
+    )
+
+    with SqliteTrackerState(tmp_path / "tracker.sqlite3") as state:
+        state.save_spreadsheet_id("spreadsheet-recovery")
+        exit_code = run(
+            workspace=ExistingTracker(),
+            state=state,
+            stdout=StringIO(),
+            sync=SyncAdapters(
+                mailbox=mailbox,
+                classifier=ScenarioClassifier(
+                    {
+                        "First application": first_application,
+                        "Second application": second_application,
+                        "Offer": StatusUpdate(
+                            company="Example Corp",
+                            position="Designer",
+                            status="Offer",
+                        ),
+                    }
+                ),
+                application_sheet=sheet,
+                confirm=lambda: True,
+            ),
+            full_rescan=True,
+        )
+
+        assert state.get_application_for_thread("shared-thread") is None
+
+    assert exit_code == 0
+    assert sheet.rows == [
+        ("spreadsheet-recovery", first_application),
+        ("spreadsheet-recovery", second_application),
+    ]
+    assert sheet.review_rows[0][1].reason == (
+        "Gmail thread maps to multiple existing Applications during recovery."
+    )
