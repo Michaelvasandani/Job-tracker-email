@@ -9,6 +9,7 @@ from job_tracker_email.sync import (
     ApplicationStatus,
     PendingApplicationWrite,
     PendingStatusUpdate,
+    parse_application_status,
 )
 
 
@@ -50,6 +51,14 @@ class SqliteTrackerState:
                 gmail_message_id TEXT PRIMARY KEY,
                 row_number INTEGER NOT NULL,
                 status TEXT NOT NULL
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS application_threads (
+                gmail_thread_id TEXT PRIMARY KEY,
+                application_row_number INTEGER NOT NULL
             )
             """
         )
@@ -145,13 +154,44 @@ class SqliteTrackerState:
         ).fetchone()
         if row is None:
             return None
-        status = str(row[1])
+        status = parse_application_status(str(row[1]))
         if status not in {"Rejected", "Offer", "Withdrawn"}:
             raise RuntimeError("Pending Status update has an invalid Status.")
         return PendingStatusUpdate(
             row_number=int(row[0]),
-            status=status,  # type: ignore[arg-type]
+            status=status,
         )
+
+    def get_application_row_for_thread(self, thread_id: str) -> int | None:
+        row = self._connection.execute(
+            """
+            SELECT application_row_number
+            FROM application_threads
+            WHERE gmail_thread_id = ?
+            """,
+            (thread_id,),
+        ).fetchone()
+        return None if row is None else int(row[0])
+
+    def record_application_thread(
+        self,
+        thread_id: str,
+        row_number: int,
+    ) -> None:
+        if not thread_id:
+            return
+        self._connection.execute(
+            """
+            INSERT INTO application_threads (
+                gmail_thread_id, application_row_number
+            )
+            VALUES (?, ?)
+            ON CONFLICT(gmail_thread_id) DO UPDATE SET
+                application_row_number = excluded.application_row_number
+            """,
+            (thread_id, row_number),
+        )
+        self._connection.commit()
 
     def record_pending_application_write(
         self,

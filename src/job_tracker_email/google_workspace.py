@@ -7,13 +7,15 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 from job_tracker_email.sync import (
     Application,
+    ApplicationStatus,
     GmailMessage,
     MailboxScan,
     NeedsReview,
+    parse_application_status,
 )
 
 
@@ -129,12 +131,19 @@ class GoogleApiWorkspace:
         self,
         spreadsheet_id: str,
         application: Application,
-    ) -> None:
-        self._append_row(
+    ) -> int:
+        response = self._append_row(
             spreadsheet_id,
             "Applications!A:E",
             self._application_row(application),
         )
+        updated_range = response.get("updates", {}).get("updatedRange")
+        if not isinstance(updated_range, str):
+            raise RuntimeError("Google Sheets did not return an Application row.")
+        match = re.search(r"!A(\d+):", updated_range)
+        if match is None:
+            raise RuntimeError("Google Sheets returned an invalid Application row.")
+        return int(match.group(1))
 
     def count_matching_applications(
         self,
@@ -150,7 +159,7 @@ class GoogleApiWorkspace:
     def list_applications(
         self,
         spreadsheet_id: str,
-    ) -> tuple[Application, ...]:
+    ) -> tuple[Application | None, ...]:
         service = self._build_google_service("sheets", "v4")
         response = (
             service.spreadsheets()
@@ -158,19 +167,22 @@ class GoogleApiWorkspace:
             .get(spreadsheetId=spreadsheet_id, range="Applications!A2:E")
             .execute()
         )
-        applications: list[Application] = []
+        applications: list[Application | None] = []
         for row in response.get("values", []):
             if not isinstance(row, list) or len(row) < 4:
+                applications.append(None)
                 continue
             values = [str(value) for value in row] + [""] * (5 - len(row))
-            if values[3] not in {"Active", "Rejected", "Offer", "Withdrawn"}:
+            status = parse_application_status(values[3])
+            if status is None:
+                applications.append(None)
                 continue
             applications.append(
                 Application(
                     company=values[0],
                     position=values[1],
                     application_date=values[2],
-                    status=values[3],  # type: ignore[arg-type]
+                    status=status,
                     stage=values[4],
                 )
             )
@@ -180,7 +192,7 @@ class GoogleApiWorkspace:
         self,
         spreadsheet_id: str,
         row_number: int,
-        status: str,
+        status: ApplicationStatus,
     ) -> None:
         service = self._build_google_service("sheets", "v4")
         (
@@ -222,9 +234,10 @@ class GoogleApiWorkspace:
         spreadsheet_id: str,
         cell_range: str,
         row: list[str],
-    ) -> None:
+    ) -> dict[str, Any]:
         service = self._build_google_service("sheets", "v4")
-        (
+        return cast(
+            dict[str, Any],
             service.spreadsheets()
             .values()
             .append(
@@ -234,7 +247,7 @@ class GoogleApiWorkspace:
                 insertDataOption="INSERT_ROWS",
                 body={"values": [row]},
             )
-            .execute()
+            .execute(),
         )
 
     def _count_matching_rows(
@@ -379,6 +392,7 @@ class GoogleApiWorkspace:
             subject=headers.get("subject", ""),
             timestamp=timestamp,
             normalized_body=cls._normalize_body(body),
+            thread_id=str(response.get("threadId", "")),
         )
 
     @classmethod

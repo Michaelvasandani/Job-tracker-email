@@ -83,6 +83,14 @@ class TrackerState(Protocol):
         status: ApplicationStatus,
     ) -> None: ...
 
+    def get_application_row_for_thread(self, thread_id: str) -> int | None: ...
+
+    def record_application_thread(
+        self,
+        thread_id: str,
+        row_number: int,
+    ) -> None: ...
+
     def record_successful_sync(
         self,
         checkpoint: str,
@@ -115,12 +123,12 @@ class ApplicationSheet(Protocol):
         self,
         spreadsheet_id: str,
         application: Application,
-    ) -> None: ...
+    ) -> int: ...
 
     def list_applications(
         self,
         spreadsheet_id: str,
-    ) -> tuple[Application, ...]: ...
+    ) -> tuple[Application | None, ...]: ...
 
     def update_application_status(
         self,
@@ -207,11 +215,15 @@ def run(
     applications_by_row = {
         row_number: application
         for row_number, application in enumerate(existing_applications, start=2)
+        if application is not None
     }
     planned_statuses: dict[int, ApplicationStatus] = {}
     application_proposals: list[tuple[str, Application]] = []
     status_update_proposals: list[StatusUpdateProposal] = []
     review_proposals: list[tuple[str, NeedsReview]] = []
+    message_threads = {
+        message.message_id: message.thread_id for message in messages
+    }
     for message in messages:
         pending_write = state.get_pending_application_write(
             message.message_id
@@ -245,12 +257,21 @@ def run(
         if isinstance(outcome, Application):
             application_proposals.append((message.message_id, outcome))
         elif isinstance(outcome, StatusUpdate):
-            matching_rows = [
-                row_number
-                for row_number, application in applications_by_row.items()
-                if application.company == outcome.company
-                and application.position == outcome.position
-            ]
+            thread_match = (
+                state.get_application_row_for_thread(message.thread_id)
+                if message.thread_id
+                else None
+            )
+            matching_rows = (
+                [thread_match]
+                if thread_match in applications_by_row
+                else [
+                    row_number
+                    for row_number, application in applications_by_row.items()
+                    if application.company == outcome.company
+                    and application.position == outcome.position
+                ]
+            )
             matching_proposals = [
                 proposal_index
                 for proposal_index, (_, application) in enumerate(
@@ -429,9 +450,13 @@ def run(
                     <= pending_write.matching_rows_before_write
                 )
             if should_append:
-                sync.application_sheet.append_application(
+                row_number = sync.application_sheet.append_application(
                     spreadsheet_id,
                     application,
+                )
+                state.record_application_thread(
+                    message_threads[message_id],
+                    row_number,
                 )
         for proposal in status_update_proposals:
             pending_status_update = state.get_pending_status_update(
@@ -446,6 +471,8 @@ def run(
             current_application = sync.application_sheet.list_applications(
                 spreadsheet_id
             )[proposal.row_number - 2]
+            if current_application is None:
+                raise RuntimeError("The Application row no longer has a Status.")
             if current_application.status != proposal.status:
                 sync.application_sheet.update_application_status(
                     spreadsheet_id,

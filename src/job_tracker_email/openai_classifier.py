@@ -9,6 +9,7 @@ from job_tracker_email.sync import (
     ClassificationInput,
     ReviewProposal,
     StatusUpdate,
+    parse_application_status,
 )
 
 
@@ -26,8 +27,8 @@ Return ignore for generic job alerts, saved-job reminders, recruiter outreach
 before an application, and messages about started, saved, incomplete, or
 unsubmitted applications. Return needs_review for every plausible candidacy
 message whose Company, Position, Application Date, Application identity, or
-Status is uncertain; for later hiring-process messages without reliable
-submission-date evidence; for unsupported or unclear language; and for an
+Status is uncertain; for later hiring-process messages that cannot identify an
+existing Application for a Status update; for unsupported or unclear language; and for an
 alternate Position without separate submission or candidacy evidence. Give a
 concise reason for needs_review. Do not use a later hiring-message date as an
 Application Date. Ignore and new_application must have an empty reason.
@@ -128,19 +129,19 @@ class OpenAIApplicationClassifier:
         if result["kind"] == "status_update":
             company = str(result["company"]).strip()
             position = str(result["position"]).strip()
-            status = str(result["status"]).strip()
+            status = parse_application_status(str(result["status"]).strip())
             if not company or not position:
                 raise RuntimeError(
                     "OpenAI classification omitted Status update identity."
                 )
-            if status not in {"Active", "Rejected", "Offer", "Withdrawn"}:
+            if status is None:
                 raise RuntimeError(
                     "OpenAI classification returned an invalid Status."
                 )
             return StatusUpdate(
                 company=company,
                 position=position,
-                status=status,  # type: ignore[arg-type]
+                status=status,
             )
         if result["kind"] != "new_application":
             raise RuntimeError("OpenAI classification returned an unknown kind.")

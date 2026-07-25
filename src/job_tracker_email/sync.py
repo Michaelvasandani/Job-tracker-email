@@ -5,6 +5,15 @@ from typing import Literal
 
 
 ApplicationStatus = Literal["Active", "Rejected", "Offer", "Withdrawn"]
+APPLICATION_STATUSES: frozenset[ApplicationStatus] = frozenset(
+    {"Active", "Rejected", "Offer", "Withdrawn"}
+)
+
+
+def parse_application_status(value: str) -> ApplicationStatus | None:
+    if value not in APPLICATION_STATUSES:
+        return None
+    return value
 
 
 @dataclass(frozen=True)
@@ -14,6 +23,7 @@ class GmailMessage:
     subject: str
     timestamp: str
     normalized_body: str
+    thread_id: str = ""
 
 
 @dataclass(frozen=True)

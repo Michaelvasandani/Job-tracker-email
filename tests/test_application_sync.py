@@ -80,8 +80,9 @@ class RecordingApplicationSheet:
         self,
         spreadsheet_id: str,
         application: Application,
-    ) -> None:
+    ) -> int:
         self.rows.append((spreadsheet_id, application))
+        return len(self.rows) + 1
 
     def count_matching_applications(
         self,
@@ -107,9 +108,12 @@ class RecordingApplicationSheet:
     def list_applications(
         self,
         spreadsheet_id: str,
-    ) -> tuple[Application, ...]:
+    ) -> tuple[Application | None, ...]:
         return tuple(
             application
+            if application.status
+            in {"Active", "Rejected", "Offer", "Withdrawn"}
+            else None
             for row_spreadsheet_id, application in self.rows
             if row_spreadsheet_id == spreadsheet_id
         )
@@ -135,13 +139,14 @@ class FailOnceApplicationSheet(RecordingApplicationSheet):
         self,
         spreadsheet_id: str,
         application: Application,
-    ) -> None:
+    ) -> int:
         self.attempts += 1
-        super().append_application(spreadsheet_id, application)
+        row_number = super().append_application(spreadsheet_id, application)
         if self.attempts == 1:
             raise RuntimeError(
                 "write failed while handling private-email-body"
             )
+        return row_number
 
 
 class FailOnceStatusSheet(RecordingApplicationSheet):
@@ -267,6 +272,7 @@ def test_approving_preview_appends_clear_application_and_checkpoints(
                     subject="We received your application",
                     timestamp="2026-07-23T18:30:00Z",
                     normalized_body=raw_body,
+                    thread_id="application-thread-1",
                 ),
             ),
             checkpoint="checkpoint-101",
@@ -300,6 +306,7 @@ def test_approving_preview_appends_clear_application_and_checkpoints(
 
         assert state.get_successful_checkpoint() == "checkpoint-101"
         assert state.has_processed_message("gmail-message-1")
+        assert state.get_application_row_for_thread("application-thread-1") == 2
 
     assert exit_code == 0
     assert stdout.getvalue() == (
@@ -1043,6 +1050,123 @@ def test_ambiguous_status_update_is_reviewed_without_changing_any_row(
     )
 
 
+def test_gmail_thread_relationship_disambiguates_same_role_applications(
+    tmp_path: Path,
+) -> None:
+    application = Application(
+        company="Example Corp",
+        position="Engineer",
+        application_date="2026-07-01",
+    )
+    sheet = RecordingApplicationSheet()
+    sheet.rows = [
+        ("spreadsheet-thread", application),
+        ("spreadsheet-thread", application),
+    ]
+
+    with SqliteTrackerState(tmp_path / "tracker.sqlite3") as state:
+        state.save_spreadsheet_id("spreadsheet-thread")
+        state.record_application_thread("thread-second-application", 3)
+        exit_code = run(
+            workspace=ExistingTracker(),
+            state=state,
+            stdout=StringIO(),
+            sync=SyncAdapters(
+                mailbox=FakeMailbox(
+                    MailboxScan(
+                        messages=(
+                            GmailMessage(
+                                message_id="thread-status-update",
+                                thread_id="thread-second-application",
+                                sender="Example Corp <jobs@example.com>",
+                                subject="Update",
+                                timestamp="2026-07-24T12:00:00Z",
+                                normalized_body="The role was filled.",
+                            ),
+                        ),
+                        checkpoint="checkpoint-thread",
+                    )
+                ),
+                classifier=RecordingClassifier(
+                    StatusUpdate(
+                        company="Example Corp",
+                        position="Engineer",
+                        status="Rejected",
+                    )
+                ),
+                application_sheet=sheet,
+                confirm=lambda: True,
+            ),
+        )
+
+    assert exit_code == 0
+    assert sheet.rows[0][1].status == "Active"
+    assert sheet.rows[1][1].status == "Rejected"
+    assert sheet.review_rows == []
+
+
+def test_status_update_uses_the_actual_sheet_row_after_an_invalid_row(
+    tmp_path: Path,
+) -> None:
+    sheet = RecordingApplicationSheet()
+    sheet.rows = [
+        (
+            "spreadsheet-row-address",
+            Application(
+                company="Manual row",
+                position="Do not alter",
+                application_date="2026-07-01",
+                status=cast(ApplicationStatus, ""),
+            ),
+        ),
+        (
+            "spreadsheet-row-address",
+            Application(
+                company="Example Corp",
+                position="Engineer",
+                application_date="2026-07-02",
+            ),
+        ),
+    ]
+
+    with SqliteTrackerState(tmp_path / "tracker.sqlite3") as state:
+        state.save_spreadsheet_id("spreadsheet-row-address")
+        exit_code = run(
+            workspace=ExistingTracker(),
+            state=state,
+            stdout=StringIO(),
+            sync=SyncAdapters(
+                mailbox=FakeMailbox(
+                    MailboxScan(
+                        messages=(
+                            GmailMessage(
+                                message_id="update-second-row",
+                                sender="Example Corp <jobs@example.com>",
+                                subject="Offer",
+                                timestamp="2026-07-24T12:00:00Z",
+                                normalized_body="An offer.",
+                            ),
+                        ),
+                        checkpoint="checkpoint-row-address",
+                    )
+                ),
+                classifier=RecordingClassifier(
+                    StatusUpdate(
+                        company="Example Corp",
+                        position="Engineer",
+                        status="Offer",
+                    )
+                ),
+                application_sheet=sheet,
+                confirm=lambda: True,
+            ),
+        )
+
+    assert exit_code == 0
+    assert str(sheet.rows[0][1].status) == ""
+    assert sheet.rows[1][1].status == "Offer"
+
+
 def test_failed_status_update_retries_without_reclassifying_or_rewriting(
     tmp_path: Path,
 ) -> None:
@@ -1095,6 +1219,72 @@ def test_failed_status_update_retries_without_reclassifying_or_rewriting(
     assert sheet.rows[0][1].status == "Offer"
     assert sheet.status_attempts == 1
     assert len(classifier.received) == 1
+
+
+@pytest.mark.parametrize(
+    ("current_status", "proposed_status", "requires_review"),
+    [
+        pytest.param("Rejected", "Offer", True, id="rejected-is-terminal"),
+        pytest.param("Offer", "Withdrawn", True, id="offer-is-terminal"),
+        pytest.param("Withdrawn", "Rejected", True, id="withdrawn-is-terminal"),
+        pytest.param("Offer", "Offer", False, id="declined-offer-remains-offer"),
+    ],
+)
+def test_terminal_statuses_are_not_replaced_automatically(
+    tmp_path: Path,
+    current_status: str,
+    proposed_status: str,
+    requires_review: bool,
+) -> None:
+    sheet = RecordingApplicationSheet()
+    sheet.rows = [
+        (
+            "spreadsheet-terminal",
+            Application(
+                company="Example Corp",
+                position="Engineer",
+                application_date="2026-07-01",
+                status=cast(ApplicationStatus, current_status),
+            ),
+        )
+    ]
+
+    with SqliteTrackerState(tmp_path / "tracker.sqlite3") as state:
+        state.save_spreadsheet_id("spreadsheet-terminal")
+        exit_code = run(
+            workspace=ExistingTracker(),
+            state=state,
+            stdout=StringIO(),
+            sync=SyncAdapters(
+                mailbox=FakeMailbox(
+                    MailboxScan(
+                        messages=(
+                            GmailMessage(
+                                message_id="terminal-update",
+                                sender="Example Corp <jobs@example.com>",
+                                subject="Update",
+                                timestamp="2026-07-24T12:00:00Z",
+                                normalized_body="A final decision.",
+                            ),
+                        ),
+                        checkpoint="checkpoint-terminal",
+                    )
+                ),
+                classifier=RecordingClassifier(
+                    StatusUpdate(
+                        company="Example Corp",
+                        position="Engineer",
+                        status=cast(ApplicationStatus, proposed_status),
+                    )
+                ),
+                application_sheet=sheet,
+                confirm=lambda: True,
+            ),
+        )
+
+    assert exit_code == 0
+    assert sheet.rows[0][1].status == current_status
+    assert len(sheet.review_rows) == int(requires_review)
 
 
 def test_real_gmail_adapter_excludes_attachment_text_from_classifier(

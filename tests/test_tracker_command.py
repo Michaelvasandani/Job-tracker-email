@@ -51,7 +51,7 @@ class FakeGoogleWorkspace:
         self,
         spreadsheet_id: str,
         application: Application,
-    ) -> None:
+    ) -> int:
         raise AssertionError("An empty mailbox cannot append an Application.")
 
     def count_matching_applications(
@@ -320,7 +320,7 @@ def test_command_does_not_print_secrets_from_google_errors(
             self,
             spreadsheet_id: str,
             application: Application,
-        ) -> None:
+        ) -> int:
             raise AssertionError("Spreadsheet creation must fail first.")
 
         def list_applications(
