@@ -9,6 +9,7 @@ from job_tracker_email.sync import (
     ApplicationStatus,
     PendingApplicationWrite,
     PendingStatusUpdate,
+    ThreadApplication,
     parse_application_status,
 )
 
@@ -59,6 +60,16 @@ class SqliteTrackerState:
             CREATE TABLE IF NOT EXISTS application_threads (
                 gmail_thread_id TEXT PRIMARY KEY,
                 application_row_number INTEGER NOT NULL
+            )
+            """
+        )
+        self._connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS application_thread_identities (
+                gmail_thread_id TEXT PRIMARY KEY,
+                company TEXT NOT NULL,
+                position TEXT NOT NULL,
+                application_date TEXT NOT NULL
             )
             """
         )
@@ -162,21 +173,39 @@ class SqliteTrackerState:
             status=status,
         )
 
-    def get_application_row_for_thread(self, thread_id: str) -> int | None:
+    def get_application_for_thread(
+        self,
+        thread_id: str,
+    ) -> ThreadApplication | None:
         row = self._connection.execute(
             """
-            SELECT application_row_number
+            SELECT
+                application_threads.application_row_number,
+                application_thread_identities.company,
+                application_thread_identities.position,
+                application_thread_identities.application_date
             FROM application_threads
-            WHERE gmail_thread_id = ?
+            JOIN application_thread_identities
+            ON application_threads.gmail_thread_id =
+                application_thread_identities.gmail_thread_id
+            WHERE application_threads.gmail_thread_id = ?
             """,
             (thread_id,),
         ).fetchone()
-        return None if row is None else int(row[0])
+        if row is None:
+            return None
+        return ThreadApplication(
+            row_number=int(row[0]),
+            company=str(row[1]),
+            position=str(row[2]),
+            application_date=str(row[3]),
+        )
 
     def record_application_thread(
         self,
         thread_id: str,
         row_number: int,
+        application: Application,
     ) -> None:
         if not thread_id:
             return
@@ -190,6 +219,24 @@ class SqliteTrackerState:
                 application_row_number = excluded.application_row_number
             """,
             (thread_id, row_number),
+        )
+        self._connection.execute(
+            """
+            INSERT INTO application_thread_identities (
+                gmail_thread_id, company, position, application_date
+            )
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(gmail_thread_id) DO UPDATE SET
+                company = excluded.company,
+                position = excluded.position,
+                application_date = excluded.application_date
+            """,
+            (
+                thread_id,
+                application.company,
+                application.position,
+                application.application_date,
+            ),
         )
         self._connection.commit()
 

@@ -28,6 +28,7 @@ from job_tracker_email.sync import (
     NeedsReview,
     ReviewProposal,
     StatusUpdate,
+    ThreadApplication,
 )
 
 
@@ -83,12 +84,16 @@ class TrackerState(Protocol):
         status: ApplicationStatus,
     ) -> None: ...
 
-    def get_application_row_for_thread(self, thread_id: str) -> int | None: ...
+    def get_application_for_thread(
+        self,
+        thread_id: str,
+    ) -> ThreadApplication | None: ...
 
     def record_application_thread(
         self,
         thread_id: str,
         row_number: int,
+        application: Application,
     ) -> None: ...
 
     def record_successful_sync(
@@ -257,21 +262,41 @@ def run(
         if isinstance(outcome, Application):
             application_proposals.append((message.message_id, outcome))
         elif isinstance(outcome, StatusUpdate):
-            thread_match = (
-                state.get_application_row_for_thread(message.thread_id)
+            thread_application = (
+                state.get_application_for_thread(message.thread_id)
                 if message.thread_id
                 else None
             )
-            matching_rows = (
-                [thread_match]
-                if thread_match in applications_by_row
-                else [
+            if thread_application is not None:
+                mapped_application = applications_by_row.get(
+                    thread_application.row_number
+                )
+                if (
+                    mapped_application is None
+                    or mapped_application.company != thread_application.company
+                    or mapped_application.position != thread_application.position
+                    or mapped_application.application_date
+                    != thread_application.application_date
+                ):
+                    review_proposals.append(
+                        (
+                            message.message_id,
+                            _needs_review(
+                                message,
+                                "The Gmail thread no longer maps to its "
+                                "original Application.",
+                            ),
+                        )
+                    )
+                    continue
+                matching_rows = [thread_application.row_number]
+            else:
+                matching_rows = [
                     row_number
                     for row_number, application in applications_by_row.items()
                     if application.company == outcome.company
                     and application.position == outcome.position
                 ]
-            )
             matching_proposals = [
                 proposal_index
                 for proposal_index, (_, application) in enumerate(
@@ -457,6 +482,7 @@ def run(
                 state.record_application_thread(
                     message_threads[message_id],
                     row_number,
+                    application,
                 )
         for proposal in status_update_proposals:
             pending_status_update = state.get_pending_status_update(

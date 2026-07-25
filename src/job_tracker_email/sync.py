@@ -84,3 +84,11 @@ class PendingApplicationWrite:
 class PendingStatusUpdate:
     row_number: int
     status: ApplicationStatus
+
+
+@dataclass(frozen=True)
+class ThreadApplication:
+    row_number: int
+    company: str
+    position: str
+    application_date: str

@@ -27,6 +27,7 @@ from job_tracker_email.sync import (
     NeedsReview,
     ReviewProposal,
     StatusUpdate,
+    ThreadApplication,
 )
 from job_tracker_email.state import SqliteTrackerState
 
@@ -306,7 +307,14 @@ def test_approving_preview_appends_clear_application_and_checkpoints(
 
         assert state.get_successful_checkpoint() == "checkpoint-101"
         assert state.has_processed_message("gmail-message-1")
-        assert state.get_application_row_for_thread("application-thread-1") == 2
+        assert state.get_application_for_thread("application-thread-1") == (
+            ThreadApplication(
+                row_number=2,
+                company="Acme Corporation",
+                position="Senior Software Engineer",
+                application_date="2026-07-23",
+            )
+        )
 
     assert exit_code == 0
     assert stdout.getvalue() == (
@@ -1066,7 +1074,11 @@ def test_gmail_thread_relationship_disambiguates_same_role_applications(
 
     with SqliteTrackerState(tmp_path / "tracker.sqlite3") as state:
         state.save_spreadsheet_id("spreadsheet-thread")
-        state.record_application_thread("thread-second-application", 3)
+        state.record_application_thread(
+            "thread-second-application",
+            3,
+            application,
+        )
         exit_code = run(
             workspace=ExistingTracker(),
             state=state,
@@ -1103,6 +1115,68 @@ def test_gmail_thread_relationship_disambiguates_same_role_applications(
     assert sheet.rows[0][1].status == "Active"
     assert sheet.rows[1][1].status == "Rejected"
     assert sheet.review_rows == []
+
+
+def test_stale_gmail_thread_mapping_is_reviewed_without_changing_a_row(
+    tmp_path: Path,
+) -> None:
+    original_application = Application(
+        company="Example Corp",
+        position="Engineer",
+        application_date="2026-07-01",
+    )
+    replacement_application = Application(
+        company="Example Corp",
+        position="Engineer",
+        application_date="2026-07-15",
+    )
+    sheet = RecordingApplicationSheet()
+    sheet.rows = [("spreadsheet-stale-thread", replacement_application)]
+
+    with SqliteTrackerState(tmp_path / "tracker.sqlite3") as state:
+        state.save_spreadsheet_id("spreadsheet-stale-thread")
+        state.record_application_thread(
+            "old-thread",
+            2,
+            original_application,
+        )
+        exit_code = run(
+            workspace=ExistingTracker(),
+            state=state,
+            stdout=StringIO(),
+            sync=SyncAdapters(
+                mailbox=FakeMailbox(
+                    MailboxScan(
+                        messages=(
+                            GmailMessage(
+                                message_id="stale-thread-update",
+                                thread_id="old-thread",
+                                sender="Example Corp <jobs@example.com>",
+                                subject="Update",
+                                timestamp="2026-07-24T12:00:00Z",
+                                normalized_body="The role was filled.",
+                            ),
+                        ),
+                        checkpoint="checkpoint-stale-thread",
+                    )
+                ),
+                classifier=RecordingClassifier(
+                    StatusUpdate(
+                        company="Example Corp",
+                        position="Engineer",
+                        status="Rejected",
+                    )
+                ),
+                application_sheet=sheet,
+                confirm=lambda: True,
+            ),
+        )
+
+    assert exit_code == 0
+    assert sheet.rows == [("spreadsheet-stale-thread", replacement_application)]
+    assert sheet.review_rows[0][1].reason == (
+        "The Gmail thread no longer maps to its original Application."
+    )
 
 
 def test_status_update_uses_the_actual_sheet_row_after_an_invalid_row(
